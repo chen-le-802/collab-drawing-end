@@ -10,6 +10,6 @@ router.get("/health", (_req, res) => {
   res.status(200).json({ message: "OK" });
 });
 
-router.use("/v1/users", userRouter);
+router.use("/user", userRouter);
 
 export default router;

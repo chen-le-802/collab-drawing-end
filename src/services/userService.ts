@@ -38,12 +38,12 @@ export const registerUser = async (username: string, password: string) => {
 export const loginUser = async (username: string, password: string) => {
   const user = await findUserByUsername(username);
   if (!user) {
-    throw new UserServiceError("UNAUTHORIZED", "未登录");
+    throw new UserServiceError("UNAUTHORIZED", "用户不存在");
   }
 
   const isPasswordCorrect = await bcrypt.compare(password, user.password);
   if (!isPasswordCorrect) {
-    throw new UserServiceError("UNAUTHORIZED", "未登录");
+    throw new UserServiceError("UNAUTHORIZED", "用户名或密码错误");
   }
 
   const token = jwt.sign({ userId: user.id }, env.jwtSecret, {

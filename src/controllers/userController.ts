@@ -42,8 +42,12 @@ const mapServiceError = (res: Response, error: unknown): void => {
       send(res, { code: 3002, message: "用户已存在", data: null });
       return;
     }
-    if (error.code === "UNAUTHORIZED" || error.code === "USER_NOT_FOUND") {
+    if (error.code === "USER_NOT_FOUND") {
       send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+    if (error.code === "UNAUTHORIZED" || error.code === "USER_NOT_FOUND") {
+      send(res, { code: 2001, message: "用户名或密码错误", data: null });
       return;
     }
   }
