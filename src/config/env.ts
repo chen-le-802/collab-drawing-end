@@ -1,7 +1,6 @@
 import dotenv from "dotenv";
 
 // 读取项目根目录下的 .env 文件并注入到 process.env。
-// 当前仓库只提供了 .env.example，真正运行前你可以复制一份为 .env。
 dotenv.config();
 
 // 把字符串环境变量安全地转成数字。

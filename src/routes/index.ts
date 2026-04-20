@@ -1,4 +1,5 @@
 import { Router } from "express";
+import userRouter from "./user";
 
 const router = Router();
 
@@ -8,5 +9,7 @@ const router = Router();
 router.get("/health", (_req, res) => {
   res.status(200).json({ message: "OK" });
 });
+
+router.use("/v1/users", userRouter);
 
 export default router;
