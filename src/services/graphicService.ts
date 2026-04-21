@@ -22,6 +22,7 @@ type GraphicsResult = {
 
 const GRAPHIC_TYPES: GraphicObjectType[] = ["line", "rect", "circle", "text"];
 
+// 统一图形模块业务异常，controller 根据 code 映射 API 错误码。
 export class GraphicServiceError extends Error {
   constructor(
     public readonly code: "SESSION_NOT_FOUND" | "SESSION_FORBIDDEN" | "GRAPHIC_NOT_FOUND" | "GRAPHIC_EXISTS" | "INVALID_ARGUMENT",
@@ -39,6 +40,7 @@ export interface GraphicService {
   getGraphics(sessionId: number, sinceVersion?: number): Promise<GraphicsResult>;
 }
 
+// 兼容 MySQL decimal/string 数值字段，统一转换为 number。
 const toNumber = (value: unknown): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -48,6 +50,7 @@ const toIsoString = (value: Date | string): string => {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 };
 
+// 数据库行到 VO 的统一映射，避免字段转换散落在业务流程中。
 const toGraphicVO = (row: GraphicRow): GraphicVO => {
   return {
     id: row.id,
@@ -83,6 +86,7 @@ const assertString = (value: unknown, fieldName: string): void => {
   }
 };
 
+// 图形写操作依赖会话存在，优先在 service 层拦截。
 const assertSessionExists = async (sessionId: number): Promise<void> => {
   const sessionVersion = await findSessionCurrentVersion(sessionId);
   if (sessionVersion === null) {
@@ -90,6 +94,7 @@ const assertSessionExists = async (sessionId: number): Promise<void> => {
   }
 };
 
+// 图形读写都要求会话成员权限。
 const assertSessionMember = async (sessionId: number, userId: number): Promise<void> => {
   const member = await findSessionMember(sessionId, userId);
   if (!member) {
@@ -97,6 +102,7 @@ const assertSessionMember = async (sessionId: number, userId: number): Promise<v
   }
 };
 
+// 每次图形变更都推进会话版本，确保增量同步可按 version 拉取。
 const getNextVersion = async (sessionId: number, connection: PoolConnection): Promise<number> => {
   const nextVersion = await incrementSessionVersion(sessionId, connection);
   if (nextVersion === null) {
@@ -105,6 +111,7 @@ const getNextVersion = async (sessionId: number, connection: PoolConnection): Pr
   return nextVersion;
 };
 
+// 创建图形参数校验：类型、坐标、样式字段都在这里统一收口。
 const normalizeCreateGraphicData = (data: CreateGraphicDTO): CreateGraphicDTO => {
   assertString(data.objectKey, "objectKey");
   if (!GRAPHIC_TYPES.includes(data.objectType)) {
@@ -135,6 +142,7 @@ const normalizeCreateGraphicData = (data: CreateGraphicDTO): CreateGraphicDTO =>
   return data;
 };
 
+// 更新图形参数校验：至少包含一个可更新字段。
 const normalizeUpdateGraphicData = (data: UpdateGraphicDTO): UpdateGraphicDTO => {
   const keys = Object.keys(data) as Array<keyof UpdateGraphicDTO>;
   if (keys.length === 0) {
@@ -183,12 +191,14 @@ const graphicServiceImpl: GraphicService = {
 
     const existsGraphic = await findGraphicByObjectKey(sessionId, normalizedData.objectKey, true);
     if (existsGraphic) {
+      // object_key 由调用方生成，服务层只做唯一性保护。
       throw new GraphicServiceError("GRAPHIC_EXISTS", "图形对象已存在");
     }
 
     const connection = await dbPool.getConnection();
     try {
       await connection.beginTransaction();
+      // 版本号递增和图形写入放在同一事务中，避免版本与数据不一致。
       const nextVersion = await getNextVersion(sessionId, connection);
 
       const graphicId = await insertGraphicObject(
@@ -243,6 +253,7 @@ const graphicServiceImpl: GraphicService = {
         throw new GraphicServiceError("GRAPHIC_NOT_FOUND", "图形对象不存在");
       }
 
+      // 更新图形时也要推进会话版本，供协同增量同步使用。
       const nextVersion = await getNextVersion(sessionId, connection);
       await updateGraphicObjectById(
         targetGraphic.id,
@@ -292,6 +303,7 @@ const graphicServiceImpl: GraphicService = {
         throw new GraphicServiceError("GRAPHIC_NOT_FOUND", "图形对象不存在");
       }
 
+      // 删除采用软删除，保留历史对象供审计和回放。
       const nextVersion = await getNextVersion(sessionId, connection);
       await softDeleteGraphicById(targetGraphic.id, nextVersion, connection);
       await connection.commit();
@@ -312,6 +324,7 @@ const graphicServiceImpl: GraphicService = {
     const graphicsRows = await findActiveGraphicsBySessionId(sessionId, sinceVersion);
     return {
       currentVersion,
+      // 仅返回 is_deleted=0 的对象；增量由 model 层按 version 过滤。
       graphics: graphicsRows.map(toGraphicVO)
     };
   }
@@ -331,6 +344,7 @@ export const getSessionGraphicsBySessionKey = async (
     throw new GraphicServiceError("SESSION_NOT_FOUND", "会话不存在");
   }
 
+  // HTTP 层按 session_key 定位会话后复用同一套图形服务逻辑。
   await assertSessionMember(session.id, userId);
   return graphicService.getGraphics(session.id, sinceVersion);
 };

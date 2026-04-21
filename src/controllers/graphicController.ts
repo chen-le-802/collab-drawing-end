@@ -9,12 +9,14 @@ type AuthRequest = Request & {
   };
 };
 
+// session_key 为 32 字节随机数转 hex，固定 64 位十六进制字符串。
 const SESSION_KEY_REG = /^[a-f0-9]{64}$/i;
 
 const send = <T>(res: Response, payload: ApiResponse<T>): Response => {
   return res.status(200).json(payload);
 };
 
+// 增量同步参数：sinceVersion 必须是 >= 0 的整数。
 const parseSinceVersion = (value: unknown): number | null => {
   if (typeof value === "undefined") {
     return null;
@@ -29,6 +31,7 @@ const parseSinceVersion = (value: unknown): number | null => {
   return parsed;
 };
 
+// controller 统一收口业务异常到约定错误码。
 const mapServiceError = (res: Response, error: unknown): void => {
   if (error instanceof GraphicServiceError) {
     if (error.code === "INVALID_ARGUMENT") {
@@ -73,6 +76,7 @@ export const getSessionGraphics = async (req: Request, res: Response): Promise<v
       return;
     }
 
+    // 由 service 校验成员权限并按 version 返回全量/增量图形。
     const result = await getSessionGraphicsBySessionKey(sessionKey, userId, sinceVersion ?? undefined);
     send(res, { code: 0, message: "获取成功", data: result });
   } catch (error) {

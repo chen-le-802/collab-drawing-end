@@ -101,6 +101,7 @@ export const incrementSessionVersion = async (sessionId: number, connection: Poo
 
 export const insertGraphicObject = async (input: InsertGraphicInput, connection?: PoolConnection): Promise<number> => {
   const executor = getExecutor(connection);
+  // 图形默认以未删除状态写入，版本由 service 侧事务计算后传入。
   const [result] = await executor.execute<ResultSetHeader>(
     `INSERT INTO graphic_objects (
       session_id, object_key, object_type, position_x, position_y, width, height,
@@ -149,6 +150,7 @@ export const findGraphicByObjectKey = async (
   connection?: PoolConnection
 ): Promise<GraphicRow | null> => {
   const executor = getExecutor(connection);
+  // includeDeleted=true 用于 update/delete 场景识别“已软删除”对象。
   const [rows] = await executor.query<GraphicRow[]>(
     `SELECT id, session_id, object_key, object_type, position_x, position_y, width, height,
             stroke_color, fill_color, stroke_width, text_content, font_size, z_index,
@@ -168,6 +170,7 @@ export const updateGraphicObjectById = async (
   connection?: PoolConnection
 ): Promise<void> => {
   const executor = getExecutor(connection);
+  // 动态拼接更新字段，避免把未传入字段覆盖成 null。
   const fields: string[] = [];
   const params: Array<number | string | null> = [];
 
@@ -225,6 +228,7 @@ export const updateGraphicObjectById = async (
 
 export const softDeleteGraphicById = async (graphicId: number, version: number, connection?: PoolConnection): Promise<void> => {
   const executor = getExecutor(connection);
+  // 软删除只标记 is_deleted，不做物理删除。
   await executor.execute<ResultSetHeader>(
     "UPDATE graphic_objects SET is_deleted = 1, version = ?, updated_at = NOW() WHERE id = ?",
     [version, graphicId]
@@ -233,6 +237,7 @@ export const softDeleteGraphicById = async (graphicId: number, version: number, 
 
 export const findActiveGraphicsBySessionId = async (sessionId: number, sinceVersion?: number): Promise<GraphicRow[]> => {
   const hasSince = typeof sinceVersion === "number";
+  // 增量拉取走 version 排序，全量拉取走 z_index 排序，满足画布渲染顺序。
   const sql = hasSince
     ? `SELECT id, session_id, object_key, object_type, position_x, position_y, width, height,
               stroke_color, fill_color, stroke_width, text_content, font_size, z_index,
