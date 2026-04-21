@@ -1,4 +1,5 @@
 import { Router } from "express";
+import graphicRouter from "./graphic";
 import userRouter from "./user";
 import sessionRouter from "./session";
 
@@ -12,6 +13,7 @@ router.get("/health", (_req, res) => {
 });
 
 router.use("/v1/user", userRouter);
+router.use("/v1/sessions/:sessionKey/graphics", graphicRouter);
 router.use("/v1/sessions", sessionRouter);
 
 export default router;

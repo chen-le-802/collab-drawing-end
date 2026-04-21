@@ -1,6 +1,7 @@
 import { randomBytes } from "crypto";
 
 import { dbPool } from "../config/db";
+import { graphicService } from "./graphicService";
 import {
   countSessionsByCreator,
   countUserJoinedSessions,
@@ -181,8 +182,9 @@ export const getSessionDetailForUser = async (sessionKey: string, userId: number
 };
 
 const getSessionGraphicsSnapshot = async (_sessionId: number): Promise<GraphicVO[]> => {
-  // 当前仓库尚未包含图形存储模块，这里先返回空数组，保持接口结构稳定。
-  return [];
+  // join 会话时返回当前画布全量数据。
+  const snapshot = await graphicService.getGraphics(_sessionId);
+  return snapshot.graphics;
 };
 
 export const joinSessionForUser = async (sessionKey: string, userId: number): Promise<SessionJoinVO> => {

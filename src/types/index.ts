@@ -25,8 +25,55 @@ export interface AuthPayload {
   userId: number;
 }
 
+export type GraphicObjectType = "line" | "rect" | "circle" | "text";
+
 export interface GraphicVO {
-  [key: string]: unknown;
+  id: number;
+  sessionId: number;
+  objectKey: string;
+  objectType: GraphicObjectType;
+  positionX: number;
+  positionY: number;
+  width: number | null;
+  height: number | null;
+  strokeColor: string;
+  fillColor: string | null;
+  strokeWidth: number;
+  textContent: string | null;
+  fontSize: number | null;
+  zIndex: number;
+  version: number;
+  creatorId: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateGraphicDTO {
+  objectKey: string;
+  objectType: GraphicObjectType;
+  positionX: number;
+  positionY: number;
+  width?: number;
+  height?: number;
+  strokeColor: string;
+  fillColor?: string;
+  strokeWidth: number;
+  textContent?: string;
+  fontSize?: number;
+  zIndex: number;
+}
+
+export interface UpdateGraphicDTO {
+  positionX?: number;
+  positionY?: number;
+  width?: number;
+  height?: number;
+  strokeColor?: string;
+  fillColor?: string;
+  strokeWidth?: number;
+  textContent?: string;
+  fontSize?: number;
+  zIndex?: number;
 }
 
 export interface SessionVO {
