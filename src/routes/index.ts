@@ -1,5 +1,6 @@
 import { Router } from "express";
 import userRouter from "./user";
+import sessionRouter from "./session";
 
 const router = Router();
 
@@ -10,6 +11,7 @@ router.get("/health", (_req, res) => {
   res.status(200).json({ message: "OK" });
 });
 
-router.use("/user", userRouter);
+router.use("/v1/user", userRouter);
+router.use("/v1/sessions", sessionRouter);
 
 export default router;
