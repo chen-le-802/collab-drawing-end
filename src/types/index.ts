@@ -7,10 +7,16 @@ export interface ApiResponse<T> {
 export interface UserVO {
   id: number;
   username: string;
+  avatar?: string;
   role: number;
   status: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface UpdateProfileDTO {
+  username?: string;
+  avatar?: string;
 }
 
 export interface AuthToken {

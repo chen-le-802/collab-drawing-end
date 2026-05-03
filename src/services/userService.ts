@@ -2,9 +2,9 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
 import { env } from "../config/env";
-import { UserVO } from "../types";
+import { UpdateProfileDTO, UserVO } from "../types";
 import { createAuthToken, deleteAuthTokensByUserId, findAuthTokenByToken } from "../models/authTokenModel";
-import { createUser, findUserById, findUserByUsername, UserRow } from "../models/userModel";
+import { createUser, findUserById, findUserByUsername, updateUserProfileById, UserRow } from "../models/userModel";
 
 const BCRYPT_ROUNDS = 10;
 const JWT_EXPIRES_SECONDS = 24 * 60 * 60;
@@ -27,11 +27,12 @@ export const registerUser = async (username: string, password: string) => {
   }
 
   const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
-  const userId = await createUser(username, hashedPassword);
+  const userId = await createUser(username, hashedPassword, null);
 
   return {
     userId,
-    username
+    username,
+    avatar: null
   };
 };
 
@@ -69,6 +70,32 @@ export const getCurrentUser = async (userId: number): Promise<UserVO> => {
   return toUserVO(user);
 };
 
+export const updateProfile = async (userId: number, payload: UpdateProfileDTO): Promise<UserVO> => {
+  const currentUser = await findUserById(userId);
+  if (!currentUser) {
+    throw new UserServiceError("USER_NOT_FOUND", "未登录");
+  }
+
+  const nextUsername = payload.username !== undefined ? payload.username.trim() : currentUser.username;
+  const nextAvatar = payload.avatar !== undefined ? payload.avatar : currentUser.avatar;
+
+  if (nextUsername !== currentUser.username) {
+    const existsUser = await findUserByUsername(nextUsername);
+    if (existsUser && existsUser.id !== userId) {
+      throw new UserServiceError("USER_EXISTS", "用户已存在");
+    }
+  }
+
+  await updateUserProfileById(userId, nextUsername, nextAvatar);
+
+  const updatedUser = await findUserById(userId);
+  if (!updatedUser) {
+    throw new UserServiceError("USER_NOT_FOUND", "未登录");
+  }
+
+  return toUserVO(updatedUser);
+};
+
 export const getAuthTokenByToken = findAuthTokenByToken;
 
 export const removeAuthTokenByUserId = async (userId: number): Promise<void> => {
@@ -79,6 +106,7 @@ const toUserVO = (user: UserRow): UserVO => {
   return {
     id: user.id,
     username: user.username,
+    ...(user.avatar ? { avatar: user.avatar } : {}),
     role: user.role,
     status: user.status,
     createdAt: user.created_at instanceof Date ? user.created_at.toISOString() : new Date(user.created_at).toISOString(),

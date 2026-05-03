@@ -1,10 +1,11 @@
 import { Request, Response } from "express";
-import { ApiResponse } from "../types";
+import { ApiResponse, UpdateProfileDTO } from "../types";
 import {
   getCurrentUser,
   loginUser,
   removeAuthTokenByUserId,
   registerUser,
+  updateProfile,
   UserServiceError
 } from "../services/userService";
 
@@ -33,6 +34,22 @@ const isValidPassword = (value: unknown): value is string => {
     return false;
   }
   return value.length >= 6 && value.length <= 20;
+};
+
+const isValidAvatar = (value: unknown): value is string => {
+  if (typeof value !== "string") {
+    return false;
+  }
+  if (value.length > 500) {
+    return false;
+  }
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
 };
 
 const mapServiceError = (res: Response, error: unknown): void => {
@@ -73,7 +90,7 @@ export const register = async (req: Request, res: Response): Promise<void> => {
 
     send(res, {
       code: 0,
-      message: "注册成功",
+      message: "success",
       data: createdUser
     });
   } catch (error) {
@@ -99,7 +116,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     send(res, {
       code: 0,
-      message: "登录成功",
+      message: "success",
       data: loginResult
     });
   } catch (error) {
@@ -122,7 +139,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
 
     send(res, {
       code: 0,
-      message: "获取成功",
+      message: "success",
       data: currentUser
     });
   } catch (error) {
@@ -144,8 +161,75 @@ export const logout = async (req: Request, res: Response): Promise<void> => {
 
     send(res, {
       code: 0,
-      message: "退出成功",
+      message: "success",
       data: null
+    });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const getProfile = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const currentUser = await getCurrentUser(userId);
+
+    send(res, {
+      code: 0,
+      message: "success",
+      data: currentUser
+    });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const putProfile = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const { username, avatar } = req.body as {
+      username?: unknown;
+      avatar?: unknown;
+    };
+
+    if (username !== undefined && !isValidUsername(username)) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    if (avatar !== undefined && !isValidAvatar(avatar)) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const payload: UpdateProfileDTO = {};
+    if (typeof username === "string") {
+      payload.username = username.trim();
+    }
+    if (typeof avatar === "string") {
+      payload.avatar = avatar;
+    }
+
+    const updatedUser = await updateProfile(userId, payload);
+
+    send(res, {
+      code: 0,
+      message: "success",
+      data: updatedUser
     });
   } catch (error) {
     mapServiceError(res, error);

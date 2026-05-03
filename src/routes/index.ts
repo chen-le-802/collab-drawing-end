@@ -13,6 +13,7 @@ router.get("/health", (_req, res) => {
 });
 
 router.use("/v1/user", userRouter);
+router.use("/v1/users", userRouter);
 router.use("/v1/sessions/:sessionKey/graphics", graphicRouter);
 router.use("/v1/sessions", sessionRouter);
 

@@ -124,11 +124,11 @@ export const countUserJoinedSessions = async (userId: number, status?: number): 
     ? `SELECT COUNT(DISTINCT s.id) AS total
        FROM session_members sm
        INNER JOIN sessions s ON s.id = sm.session_id
-       WHERE sm.user_id = ? AND s.status = ?`
+       WHERE sm.user_id = ? AND sm.online_status = 1 AND s.status = ?`
     : `SELECT COUNT(DISTINCT s.id) AS total
        FROM session_members sm
        INNER JOIN sessions s ON s.id = sm.session_id
-       WHERE sm.user_id = ?`;
+       WHERE sm.user_id = ? AND sm.online_status = 1`;
 
   const params = hasStatusFilter ? [userId, status] : [userId];
   const [rows] = await dbPool.query<TotalRow[]>(sql, params);
@@ -164,7 +164,7 @@ export const findUserJoinedSessions = async (
        INNER JOIN sessions s ON s.id = sm.session_id
        LEFT JOIN users u ON u.id = s.creator_id
        LEFT JOIN session_members sm_all ON sm_all.session_id = s.id
-       WHERE sm.user_id = ? AND s.status = ?
+       WHERE sm.user_id = ? AND sm.online_status = 1 AND s.status = ?
        GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.created_at, s.updated_at
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`
@@ -173,7 +173,7 @@ export const findUserJoinedSessions = async (
        INNER JOIN sessions s ON s.id = sm.session_id
        LEFT JOIN users u ON u.id = s.creator_id
        LEFT JOIN session_members sm_all ON sm_all.session_id = s.id
-       WHERE sm.user_id = ?
+       WHERE sm.user_id = ? AND sm.online_status = 1
        GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.created_at, s.updated_at
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`;
