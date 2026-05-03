@@ -1,5 +1,6 @@
 import cors from "cors";
 import express from "express";
+import path from "path";
 
 import { requestLogger } from "./middleware/requestLogger";
 import router from "./routes";
@@ -19,6 +20,9 @@ app.use(express.urlencoded({ extended: true }));
 
 // 请求级结构化日志，记录 requestId/耗时/状态码等关键维度。
 app.use(requestLogger);
+
+// 暴露头像静态资源目录，返回给前端可直接访问的 URL。
+app.use("/uploads", express.static(path.resolve(process.cwd(), "uploads")));
 
 // 统一把业务路由挂到 /api 前缀下。
 // 后续新增模块路由时，优先在 routes/index.ts 中集中注册。

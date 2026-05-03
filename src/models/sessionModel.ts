@@ -28,6 +28,7 @@ export type SessionMemberRow = RowDataPacket & {
   online_status: number;
   joined_at: Date | string;
   username?: string;
+  avatar?: string | null;
 };
 
 type TotalRow = RowDataPacket & {
@@ -225,6 +226,24 @@ export const findSessionMembersBySessionId = async (sessionId: number): Promise<
      WHERE sm.session_id = ?
      ORDER BY sm.role DESC, sm.joined_at ASC`,
     [sessionId]
+  );
+  return rows;
+};
+
+export const findSessionMemberPreviewsBySessionId = async (
+  sessionId: number,
+  limit = 4
+): Promise<SessionMemberRow[]> => {
+  // 卡片预览头像：优先创建者，再按加入时间升序，最多返回 limit 条。
+  const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : 4;
+  const [rows] = await dbPool.query<SessionMemberRow[]>(
+    `SELECT sm.id, sm.session_id, sm.user_id, sm.role, sm.online_status, sm.joined_at, u.username, u.avatar
+     FROM session_members sm
+     INNER JOIN users u ON u.id = sm.user_id
+     WHERE sm.session_id = ?
+     ORDER BY sm.role DESC, sm.joined_at ASC
+     LIMIT ?`,
+    [sessionId, safeLimit]
   );
   return rows;
 };

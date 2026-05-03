@@ -9,6 +9,7 @@ import {
   deleteSessionMembersBySessionId,
   findSessionBySessionKey,
   findSessionMember,
+  findSessionMemberPreviewsBySessionId,
   findSessionMembersBySessionId,
   findSessionsByCreator,
   findUserJoinedSessions,
@@ -18,7 +19,7 @@ import {
   SessionRow,
   setSessionMemberOnlineStatus
 } from "../models/sessionModel";
-import { GraphicVO, MemberVO, SessionDetailVO, SessionJoinVO, SessionVO } from "../types";
+import { GraphicVO, MemberVO, SessionDetailVO, SessionJoinVO, SessionMemberPreviewVO, SessionVO } from "../types";
 
 const SESSION_KEY_BYTE_LENGTH = 32;
 const SESSION_CREATOR_ROLE = 2;
@@ -75,6 +76,14 @@ const toMemberVO = (row: SessionMemberRow): MemberVO => {
     role: row.role,
     onlineStatus: row.online_status,
     joinedAt: toIsoString(row.joined_at)
+  };
+};
+
+const toMemberPreviewVO = (row: SessionMemberRow): SessionMemberPreviewVO => {
+  return {
+    userId: row.user_id,
+    username: row.username ?? "",
+    ...(row.avatar ? { avatar: row.avatar } : {})
   };
 };
 
@@ -156,8 +165,18 @@ export const getUserSessionList = async (
         findUserJoinedSessions(userId, page, pageSize, status)
       ]);
 
+  const listWithMemberPreviews = await Promise.all(
+    sessions.map(async (sessionRow) => {
+      const memberPreviews = await findSessionMemberPreviewsBySessionId(sessionRow.id, 4);
+      return {
+        ...toSessionVO(sessionRow),
+        memberPreviews: memberPreviews.map(toMemberPreviewVO)
+      };
+    })
+  );
+
   return {
-    list: sessions.map(toSessionVO),
+    list: listWithMemberPreviews,
     total,
     page,
     pageSize

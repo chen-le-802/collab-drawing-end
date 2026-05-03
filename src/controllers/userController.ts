@@ -235,3 +235,27 @@ export const putProfile = async (req: Request, res: Response): Promise<void> => 
     mapServiceError(res, error);
   }
 };
+
+export const uploadAvatar = async (req: Request, res: Response): Promise<void> => {
+  const authReq = req as AuthRequest;
+  const userId = authReq.user?.userId;
+  if (!userId) {
+    send(res, { code: 2001, message: "未登录", data: null });
+    return;
+  }
+
+  const uploadedFile = req.file;
+  if (!uploadedFile) {
+    send(res, { code: 1001, message: "请选择头像文件", data: null });
+    return;
+  }
+
+  const baseUrl = `${req.protocol}://${req.get("host")}`;
+  const avatarUrl = `${baseUrl}/uploads/avatars/${uploadedFile.filename}`;
+
+  send(res, {
+    code: 0,
+    message: "success",
+    data: { url: avatarUrl }
+  });
+};

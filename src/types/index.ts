@@ -19,6 +19,10 @@ export interface UpdateProfileDTO {
   avatar?: string;
 }
 
+export interface UploadAvatarVO {
+  url: string;
+}
+
 export interface AuthToken {
   id: number;
   userId: number;
@@ -90,8 +94,15 @@ export interface SessionVO {
   creatorName?: string;
   status: number;
   memberCount?: number;
+  memberPreviews?: SessionMemberPreviewVO[];
   currentVersion?: number;
   createdAt: string;
+}
+
+export interface SessionMemberPreviewVO {
+  userId: number;
+  username: string;
+  avatar?: string;
 }
 
 export interface MemberVO {
