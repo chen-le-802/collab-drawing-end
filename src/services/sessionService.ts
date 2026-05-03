@@ -12,14 +12,18 @@ import {
   findSessionMember,
   findSessionMemberPreviewsBySessionIds,
   findSessionMembersBySessionId,
+  findSessionMembersBySessionIdWithHistory,
   findSessionsByCreator,
   findUserJoinedSessions,
   insertSession,
   insertSessionMember,
   SessionMemberRow,
   SessionRow,
-  setSessionMemberOnlineStatus
-  ,
+  setSessionMemberActiveStatus,
+  setSessionMemberLeftStatus,
+  setSessionMemberRole,
+  setSessionMemberRemovedStatus,
+  setSessionCreator,
   touchSessionMemberActiveAt
 } from "../models/sessionModel";
 import { GraphicVO, MemberVO, SessionDetailVO, SessionJoinVO, SessionMemberPreviewVO, SessionVO } from "../types";
@@ -83,7 +87,10 @@ const toMemberVO = (row: SessionMemberRow): MemberVO => {
     ...(row.avatar ? { avatar: row.avatar } : {}),
     role: row.role,
     onlineStatus: isOnline ? 1 : 0,
-    joinedAt: toIsoString(row.joined_at)
+    joinedAt: toIsoString(row.joined_at),
+    ...(row.membership_status ? { membershipStatus: row.membership_status } : {}),
+    ...(row.left_at ? { leftAt: toIsoString(row.left_at) } : {}),
+    ...(row.removed_at ? { removedAt: toIsoString(row.removed_at) } : {})
   };
 };
 
@@ -109,6 +116,9 @@ const assertSessionExists = async (sessionKey: string): Promise<SessionRow> => {
 const assertSessionMember = async (sessionId: number, userId: number): Promise<SessionMemberRow> => {
   const member = await findSessionMember(sessionId, userId);
   if (!member) {
+    throw new SessionServiceError("SESSION_FORBIDDEN", "无会话访问权限");
+  }
+  if (member.membership_status !== "active") {
     throw new SessionServiceError("SESSION_FORBIDDEN", "无会话访问权限");
   }
   return member;
@@ -196,12 +206,18 @@ export const getUserSessionList = async (
   };
 };
 
-export const getSessionDetailForUser = async (sessionKey: string, userId: number): Promise<SessionDetailVO> => {
+export const getSessionDetailForUser = async (
+  sessionKey: string,
+  userId: number,
+  includeHistory = false
+): Promise<SessionDetailVO> => {
   const session = await assertSessionExists(sessionKey);
   // 非成员禁止查看详情，按 2003 返回。
   await assertSessionMember(session.id, userId);
 
-  const members = await findSessionMembersBySessionId(session.id);
+  const members = includeHistory
+    ? await findSessionMembersBySessionIdWithHistory(session.id)
+    : await findSessionMembersBySessionId(session.id);
 
   return {
     ...toSessionVO({
@@ -222,9 +238,12 @@ const getSessionGraphicsSnapshot = async (_sessionId: number): Promise<GraphicVO
 export const joinSessionForUser = async (sessionKey: string, userId: number): Promise<SessionJoinVO> => {
   const session = await assertSessionExists(sessionKey);
   const existsMember = await findSessionMember(session.id, userId);
-  if (existsMember) {
-    // 幂等设计：重复加入直接成功，并把在线状态恢复为在线。
-    await setSessionMemberOnlineStatus(session.id, userId, 1);
+  if (existsMember && existsMember.membership_status === "removed") {
+    throw new SessionServiceError("SESSION_FORBIDDEN", "无会话访问权限");
+  }
+  if (existsMember && (existsMember.membership_status === "left" || existsMember.membership_status === "active")) {
+    // 软退出后再次加入采用状态恢复，保证历史记录可追溯。
+    await setSessionMemberActiveStatus(session.id, userId);
   } else {
     // 新成员默认普通角色，在线状态置为 1。
     await insertSessionMember(session.id, userId, SESSION_MEMBER_ROLE, 1);
@@ -243,9 +262,66 @@ export const joinSessionForUser = async (sessionKey: string, userId: number): Pr
 
 export const leaveSessionForUser = async (sessionKey: string, userId: number): Promise<void> => {
   const session = await assertSessionExists(sessionKey);
+  if (session.creator_id === userId) {
+    throw new SessionServiceError("SESSION_FORBIDDEN", "创建者不能退出会话，请删除会话");
+  }
   await assertSessionMember(session.id, userId);
-  // leave 仅更新在线状态，保留成员历史记录。
-  await setSessionMemberOnlineStatus(session.id, userId, 0);
+  // leave 语义：软退出，成员从“我加入”列表移除，但保留历史记录。
+  await setSessionMemberLeftStatus(session.id, userId);
+};
+
+export const removeSessionMemberForCreator = async (
+  sessionKey: string,
+  operatorUserId: number,
+  targetUserId: number
+): Promise<void> => {
+  const session = await assertSessionExists(sessionKey);
+  assertSessionCreator(session, operatorUserId);
+
+  if (targetUserId === session.creator_id) {
+    throw new SessionServiceError("SESSION_FORBIDDEN", "不能移除创建者");
+  }
+
+  const targetMember = await findSessionMember(session.id, targetUserId);
+  if (!targetMember || targetMember.membership_status === "removed") {
+    throw new SessionServiceError("SESSION_FORBIDDEN", "无会话访问权限");
+  }
+
+  await setSessionMemberRemovedStatus(session.id, targetUserId);
+};
+
+export const transferSessionCreatorForUser = async (
+  sessionKey: string,
+  operatorUserId: number,
+  targetUserId: number
+): Promise<void> => {
+  const session = await assertSessionExists(sessionKey);
+  assertSessionCreator(session, operatorUserId);
+
+  if (targetUserId === operatorUserId) {
+    throw new SessionServiceError("SESSION_FORBIDDEN", "不能转让给自己");
+  }
+
+  const targetMember = await findSessionMember(session.id, targetUserId);
+  if (!targetMember || targetMember.membership_status !== "active") {
+    throw new SessionServiceError("SESSION_FORBIDDEN", "目标用户不是当前会话成员");
+  }
+
+  const operatorMember = await assertSessionMember(session.id, operatorUserId);
+
+  const connection = await dbPool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await setSessionCreator(session.id, targetUserId, connection);
+    await setSessionMemberRole(session.id, targetUserId, SESSION_CREATOR_ROLE, connection);
+    await setSessionMemberRole(session.id, operatorMember.user_id, SESSION_MEMBER_ROLE, connection);
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 };
 
 export const heartbeatSessionForUser = async (sessionKey: string, userId: number): Promise<void> => {

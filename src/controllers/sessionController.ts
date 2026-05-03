@@ -9,6 +9,8 @@ import {
   heartbeatSessionForUser,
   joinSessionForUser,
   leaveSessionForUser,
+  removeSessionMemberForCreator,
+  transferSessionCreatorForUser,
   SessionServiceError
 } from "../services/sessionService";
 
@@ -50,6 +52,17 @@ const parsePositiveInteger = (value: unknown): number | null => {
   return parsed;
 };
 
+const parsePathPositiveInteger = (value: unknown): number | null => {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+};
+
 // status 仅允许 0/1，避免把其他字符串误转换为数字后进入 SQL。
 const parseStatus = (value: unknown): number | null => {
   if (typeof value === "undefined") {
@@ -60,6 +73,20 @@ const parseStatus = (value: unknown): number | null => {
     return null;
   }
   return Number(normalized);
+};
+
+const parseBooleanFlag = (value: unknown): boolean | null => {
+  if (typeof value === "undefined") {
+    return null;
+  }
+  const normalized = Array.isArray(value) ? value[0] : value;
+  if (normalized === "1" || normalized === 1 || normalized === "true" || normalized === true) {
+    return true;
+  }
+  if (normalized === "0" || normalized === 0 || normalized === "false" || normalized === false) {
+    return false;
+  }
+  return null;
 };
 
 // controller 统一做 service -> API 错误码映射，保证响应结构稳定。
@@ -163,13 +190,18 @@ export const getSessionDetail = async (req: Request, res: Response): Promise<voi
     }
 
     const sessionKey = getValidatedSessionKey(req);
+    const includeHistory = parseBooleanFlag(req.query.includeHistory);
     if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof req.query.includeHistory !== "undefined" && includeHistory === null) {
       send(res, { code: 1001, message: "参数错误", data: null });
       return;
     }
 
     // service 内会校验成员关系，非成员返回 2003。
-    const result = await getSessionDetailForUser(sessionKey, userId);
+    const result = await getSessionDetailForUser(sessionKey, userId, includeHistory ?? false);
     send(res, { code: 0, message: "获取成功", data: result });
   } catch (error) {
     mapServiceError(res, error);
@@ -214,9 +246,55 @@ export const leaveSession = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    // leave 只更新在线状态，不删除历史成员关系记录。
+    // leave 为软退出：从“我加入”列表移除，但保留成员历史记录。
     await leaveSessionForUser(sessionKey, userId);
     send(res, { code: 0, message: "离开成功", data: null });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const removeSessionMember = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    const targetUserId = parsePathPositiveInteger(req.params.userId);
+    if (!sessionKey || targetUserId === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    await removeSessionMemberForCreator(sessionKey, userId, targetUserId);
+    send(res, { code: 0, message: "移除成功", data: null });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const transferSessionCreator = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    const targetUserId = parsePathPositiveInteger(req.params.userId);
+    if (!sessionKey || targetUserId === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    await transferSessionCreatorForUser(sessionKey, userId, targetUserId);
+    send(res, { code: 0, message: "转让成功", data: null });
   } catch (error) {
     mapServiceError(res, error);
   }

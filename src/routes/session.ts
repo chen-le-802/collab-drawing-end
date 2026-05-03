@@ -7,7 +7,9 @@ import {
   getSessionList,
   heartbeatSession,
   joinSession,
-  leaveSession
+  leaveSession,
+  removeSessionMember,
+  transferSessionCreator
 } from "../controllers/sessionController";
 import { authMiddleware } from "../middleware/auth";
 
@@ -22,6 +24,8 @@ router.get("/:sessionKey", getSessionDetail);
 router.post("/:sessionKey/join", joinSession);
 router.post("/:sessionKey/heartbeat", heartbeatSession);
 router.post("/:sessionKey/leave", leaveSession);
+router.post("/:sessionKey/members/:userId/remove", removeSessionMember);
+router.post("/:sessionKey/transfer/:userId", transferSessionCreator);
 router.delete("/:sessionKey", deleteSession);
 
 export default router;

@@ -114,6 +114,9 @@ export interface MemberVO {
   role: number;
   onlineStatus: number;
   joinedAt: string;
+  membershipStatus?: "active" | "left" | "removed";
+  leftAt?: string;
+  removedAt?: string;
 }
 
 export interface SessionDetailVO extends SessionVO {
