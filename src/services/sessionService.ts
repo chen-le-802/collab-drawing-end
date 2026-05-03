@@ -1,6 +1,7 @@
 import { randomBytes } from "crypto";
 
 import { dbPool } from "../config/db";
+import { env } from "../config/env";
 import { graphicService } from "./graphicService";
 import {
   countSessionsByCreator,
@@ -9,7 +10,7 @@ import {
   deleteSessionMembersBySessionId,
   findSessionBySessionKey,
   findSessionMember,
-  findSessionMemberPreviewsBySessionId,
+  findSessionMemberPreviewsBySessionIds,
   findSessionMembersBySessionId,
   findSessionsByCreator,
   findUserJoinedSessions,
@@ -18,12 +19,15 @@ import {
   SessionMemberRow,
   SessionRow,
   setSessionMemberOnlineStatus
+  ,
+  touchSessionMemberActiveAt
 } from "../models/sessionModel";
 import { GraphicVO, MemberVO, SessionDetailVO, SessionJoinVO, SessionMemberPreviewVO, SessionVO } from "../types";
 
 const SESSION_KEY_BYTE_LENGTH = 32;
 const SESSION_CREATOR_ROLE = 2;
 const SESSION_MEMBER_ROLE = 1;
+const ONLINE_TIMEOUT_SECONDS = env.sessionOnlineTimeoutSeconds;
 
 // service 层业务异常。controller 会把这里的错误码映射到统一 HTTP code。
 export class SessionServiceError extends Error {
@@ -64,17 +68,21 @@ const toSessionVO = (row: SessionRow): SessionVO => {
     creatorName: row.creator_name ?? undefined,
     status: row.status,
     memberCount: typeof row.member_count === "undefined" ? undefined : toNumber(row.member_count),
+    onlineMemberCount: typeof row.online_member_count === "undefined" ? undefined : toNumber(row.online_member_count),
     currentVersion: toNumber(row.current_version),
     createdAt: toIsoString(row.created_at)
   };
 };
 
 const toMemberVO = (row: SessionMemberRow): MemberVO => {
+  const lastActiveValue = row.last_active_at ? new Date(row.last_active_at).getTime() : 0;
+  const isOnline = row.online_status === 1 && lastActiveValue >= Date.now() - ONLINE_TIMEOUT_SECONDS * 1000;
   return {
     userId: row.user_id,
     username: row.username ?? "",
+    ...(row.avatar ? { avatar: row.avatar } : {}),
     role: row.role,
-    onlineStatus: row.online_status,
+    onlineStatus: isOnline ? 1 : 0,
     joinedAt: toIsoString(row.joined_at)
   };
 };
@@ -83,6 +91,7 @@ const toMemberPreviewVO = (row: SessionMemberRow): SessionMemberPreviewVO => {
   return {
     userId: row.user_id,
     username: row.username ?? "",
+    isOnline: row.online_status === 1,
     ...(row.avatar ? { avatar: row.avatar } : {})
   };
 };
@@ -158,22 +167,26 @@ export const getUserSessionList = async (
   const [total, sessions] = typeof creatorId === "number"
     ? await Promise.all([
         countSessionsByCreator(creatorId, status),
-        findSessionsByCreator(creatorId, page, pageSize, status)
+        findSessionsByCreator(creatorId, page, pageSize, status, ONLINE_TIMEOUT_SECONDS)
       ])
     : await Promise.all([
-        countUserJoinedSessions(userId, status),
-        findUserJoinedSessions(userId, page, pageSize, status)
-      ]);
+      countUserJoinedSessions(userId, status),
+      findUserJoinedSessions(userId, page, pageSize, status, ONLINE_TIMEOUT_SECONDS)
+    ]);
 
-  const listWithMemberPreviews = await Promise.all(
-    sessions.map(async (sessionRow) => {
-      const memberPreviews = await findSessionMemberPreviewsBySessionId(sessionRow.id, 4);
-      return {
-        ...toSessionVO(sessionRow),
-        memberPreviews: memberPreviews.map(toMemberPreviewVO)
-      };
-    })
-  );
+  const sessionIds = sessions.map((item) => item.id);
+  const previewRows = await findSessionMemberPreviewsBySessionIds(sessionIds, ONLINE_TIMEOUT_SECONDS, 4);
+  const previewMap = new Map<number, SessionMemberRow[]>();
+  previewRows.forEach((row) => {
+    const group = previewMap.get(row.session_id) ?? [];
+    group.push(row);
+    previewMap.set(row.session_id, group);
+  });
+
+  const listWithMemberPreviews = sessions.map((sessionRow) => ({
+    ...toSessionVO(sessionRow),
+    memberPreviews: (previewMap.get(sessionRow.id) ?? []).map(toMemberPreviewVO)
+  }));
 
   return {
     list: listWithMemberPreviews,
@@ -233,6 +246,12 @@ export const leaveSessionForUser = async (sessionKey: string, userId: number): P
   await assertSessionMember(session.id, userId);
   // leave 仅更新在线状态，保留成员历史记录。
   await setSessionMemberOnlineStatus(session.id, userId, 0);
+};
+
+export const heartbeatSessionForUser = async (sessionKey: string, userId: number): Promise<void> => {
+  const session = await assertSessionExists(sessionKey);
+  await assertSessionMember(session.id, userId);
+  await touchSessionMemberActiveAt(session.id, userId);
 };
 
 export const deleteSessionForUser = async (sessionKey: string, userId: number): Promise<void> => {

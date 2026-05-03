@@ -260,4 +260,38 @@ suite("API integration", () => {
     expect(incrementalKeys).toContain(objectKeyV2);
     expect(incrementalKeys).not.toContain(objectKeyV1);
   });
+
+  it("heartbeat refreshes member last_active_at", async () => {
+    const owner = await registerAndLogin();
+
+    const createSessionRes = await request(app)
+      .post("/api/v1/sessions")
+      .set(authHeader(owner.token))
+      .send({ name: `心跳会话_${randomText()}` });
+    expect(createSessionRes.body.code).toBe(0);
+    const sessionKey = createSessionRes.body.data.sessionKey as string;
+    const sessionId = createSessionRes.body.data.sessionId as number;
+
+    const [beforeRows] = await dbPool.query<Array<{ last_active_at: Date | string }>>(
+      "SELECT last_active_at FROM session_members WHERE session_id = ? AND user_id = ? LIMIT 1",
+      [sessionId, owner.userId]
+    );
+    expect(beforeRows.length).toBe(1);
+    const beforeTime = new Date(beforeRows[0].last_active_at).getTime();
+
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+
+    const heartbeatRes = await request(app)
+      .post(`/api/v1/sessions/${sessionKey}/heartbeat`)
+      .set(authHeader(owner.token));
+    expect(heartbeatRes.body.code).toBe(0);
+
+    const [afterRows] = await dbPool.query<Array<{ last_active_at: Date | string }>>(
+      "SELECT last_active_at FROM session_members WHERE session_id = ? AND user_id = ? LIMIT 1",
+      [sessionId, owner.userId]
+    );
+    expect(afterRows.length).toBe(1);
+    const afterTime = new Date(afterRows[0].last_active_at).getTime();
+    expect(afterTime).toBeGreaterThan(beforeTime);
+  });
 });

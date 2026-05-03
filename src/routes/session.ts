@@ -5,6 +5,7 @@ import {
   deleteSession,
   getSessionDetail,
   getSessionList,
+  heartbeatSession,
   joinSession,
   leaveSession
 } from "../controllers/sessionController";
@@ -19,6 +20,7 @@ router.post("/", createSession);
 router.get("/", getSessionList);
 router.get("/:sessionKey", getSessionDetail);
 router.post("/:sessionKey/join", joinSession);
+router.post("/:sessionKey/heartbeat", heartbeatSession);
 router.post("/:sessionKey/leave", leaveSession);
 router.delete("/:sessionKey", deleteSession);
 

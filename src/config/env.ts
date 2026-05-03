@@ -25,5 +25,8 @@ export const env = {
 
   // JWT 相关配置。当前骨架还没用到，但后续登录认证会用到。
   jwtSecret: process.env.JWT_SECRET ?? "",
-  jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? "7d"
+  jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? "7d",
+
+  // 会话在线状态判定超时窗口（秒），默认 60 秒。
+  sessionOnlineTimeoutSeconds: toNumber(process.env.SESSION_ONLINE_TIMEOUT_SECONDS, 60)
 };

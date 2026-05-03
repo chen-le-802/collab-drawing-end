@@ -16,6 +16,7 @@ export type SessionRow = RowDataPacket & {
   status: number;
   current_version: number;
   member_count?: number;
+  online_member_count?: number;
   created_at: Date | string;
   updated_at: Date | string;
 };
@@ -27,6 +28,7 @@ export type SessionMemberRow = RowDataPacket & {
   role: number;
   online_status: number;
   joined_at: Date | string;
+  last_active_at?: Date | string;
   username?: string;
   avatar?: string | null;
 };
@@ -86,7 +88,7 @@ export const findSessionBySessionKey = async (sessionKey: string): Promise<Sessi
 
 export const findSessionMember = async (sessionId: number, userId: number): Promise<SessionMemberRow | null> => {
   const [rows] = await dbPool.query<SessionMemberRow[]>(
-    "SELECT id, session_id, user_id, role, online_status, joined_at FROM session_members WHERE session_id = ? AND user_id = ? LIMIT 1",
+    "SELECT id, session_id, user_id, role, online_status, joined_at, last_active_at FROM session_members WHERE session_id = ? AND user_id = ? LIMIT 1",
     [sessionId, userId]
   );
   return rows[0] ?? null;
@@ -101,6 +103,14 @@ export const setSessionMemberOnlineStatus = async (
   await dbPool.execute<ResultSetHeader>(
     "UPDATE session_members SET online_status = ?, last_active_at = NOW() WHERE session_id = ? AND user_id = ?",
     [onlineStatus, sessionId, userId]
+  );
+};
+
+export const touchSessionMemberActiveAt = async (sessionId: number, userId: number): Promise<void> => {
+  // 心跳上报只刷新活跃时间，避免覆盖在线状态位。
+  await dbPool.execute<ResultSetHeader>(
+    "UPDATE session_members SET last_active_at = NOW() WHERE session_id = ? AND user_id = ?",
+    [sessionId, userId]
   );
 };
 
@@ -153,14 +163,16 @@ export const findUserJoinedSessions = async (
   userId: number,
   page: number,
   pageSize: number,
-  status?: number
+  status?: number,
+  onlineTimeoutSeconds = 60
 ): Promise<SessionRow[]> => {
   const offset = (page - 1) * pageSize;
   const hasStatusFilter = typeof status === "number";
 
   // 通过 LEFT JOIN + COUNT 计算每个会话成员数；GROUP BY 保证每个会话一行。
   const sql = hasStatusFilter
-    ? `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm_all.id) AS member_count
+    ? `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm_all.id) AS member_count,
+              SUM(CASE WHEN sm_all.online_status = 1 AND sm_all.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count
        FROM session_members sm
        INNER JOIN sessions s ON s.id = sm.session_id
        LEFT JOIN users u ON u.id = s.creator_id
@@ -169,7 +181,8 @@ export const findUserJoinedSessions = async (
        GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.created_at, s.updated_at
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`
-    : `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm_all.id) AS member_count
+    : `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm_all.id) AS member_count,
+              SUM(CASE WHEN sm_all.online_status = 1 AND sm_all.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count
        FROM session_members sm
        INNER JOIN sessions s ON s.id = sm.session_id
        LEFT JOIN users u ON u.id = s.creator_id
@@ -179,7 +192,9 @@ export const findUserJoinedSessions = async (
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`;
 
-  const params = hasStatusFilter ? [userId, status, pageSize, offset] : [userId, pageSize, offset];
+  const params = hasStatusFilter
+    ? [onlineTimeoutSeconds, userId, status, pageSize, offset]
+    : [onlineTimeoutSeconds, userId, pageSize, offset];
   const [rows] = await dbPool.query<SessionRow[]>(sql, params);
   return rows;
 };
@@ -188,14 +203,16 @@ export const findSessionsByCreator = async (
   creatorId: number,
   page: number,
   pageSize: number,
-  status?: number
+  status?: number,
+  onlineTimeoutSeconds = 60
 ): Promise<SessionRow[]> => {
   const offset = (page - 1) * pageSize;
   const hasStatusFilter = typeof status === "number";
 
   // 创建者维度查询时，不要求当前登录用户是成员。
   const sql = hasStatusFilter
-    ? `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm.id) AS member_count
+    ? `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm.id) AS member_count,
+              SUM(CASE WHEN sm.online_status = 1 AND sm.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count
        FROM sessions s
        LEFT JOIN users u ON u.id = s.creator_id
        LEFT JOIN session_members sm ON sm.session_id = s.id
@@ -203,7 +220,8 @@ export const findSessionsByCreator = async (
        GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.created_at, s.updated_at
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`
-    : `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm.id) AS member_count
+    : `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm.id) AS member_count,
+              SUM(CASE WHEN sm.online_status = 1 AND sm.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count
        FROM sessions s
        LEFT JOIN users u ON u.id = s.creator_id
        LEFT JOIN session_members sm ON sm.session_id = s.id
@@ -212,7 +230,9 @@ export const findSessionsByCreator = async (
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`;
 
-  const params = hasStatusFilter ? [creatorId, status, pageSize, offset] : [creatorId, pageSize, offset];
+  const params = hasStatusFilter
+    ? [onlineTimeoutSeconds, creatorId, status, pageSize, offset]
+    : [onlineTimeoutSeconds, creatorId, pageSize, offset];
   const [rows] = await dbPool.query<SessionRow[]>(sql, params);
   return rows;
 };
@@ -220,7 +240,7 @@ export const findSessionsByCreator = async (
 export const findSessionMembersBySessionId = async (sessionId: number): Promise<SessionMemberRow[]> => {
   // 创建者优先展示，再按加入时间升序，便于前端成员列表渲染。
   const [rows] = await dbPool.query<SessionMemberRow[]>(
-    `SELECT sm.id, sm.session_id, sm.user_id, sm.role, sm.online_status, sm.joined_at, u.username
+    `SELECT sm.id, sm.session_id, sm.user_id, sm.role, sm.online_status, sm.joined_at, sm.last_active_at, u.username, u.avatar
      FROM session_members sm
      INNER JOIN users u ON u.id = sm.user_id
      WHERE sm.session_id = ?
@@ -246,4 +266,40 @@ export const findSessionMemberPreviewsBySessionId = async (
     [sessionId, safeLimit]
   );
   return rows;
+};
+
+export const findSessionMemberPreviewsBySessionIds = async (
+  sessionIds: number[],
+  onlineTimeoutSeconds = 60,
+  limitPerSession = 4
+): Promise<SessionMemberRow[]> => {
+  if (sessionIds.length === 0) {
+    return [];
+  }
+
+  const placeholders = sessionIds.map(() => "?").join(", ");
+  const sql = `
+    SELECT t.id, t.session_id, t.user_id, t.role, t.online_status, t.joined_at, t.last_active_at, t.username, t.avatar
+    FROM (
+      SELECT sm.id, sm.session_id, sm.user_id, sm.role, sm.online_status, sm.joined_at, sm.last_active_at, u.username, u.avatar,
+             ROW_NUMBER() OVER (PARTITION BY sm.session_id ORDER BY sm.role DESC, sm.joined_at ASC) AS rn
+      FROM session_members sm
+      INNER JOIN users u ON u.id = sm.user_id
+      WHERE sm.session_id IN (${placeholders})
+    ) t
+    WHERE t.rn <= ?
+    ORDER BY t.session_id ASC, t.role DESC, t.joined_at ASC
+  `;
+
+  const params = [...sessionIds, limitPerSession];
+  const [rows] = await dbPool.query<SessionMemberRow[]>(sql, params);
+  const threshold = Date.now() - onlineTimeoutSeconds * 1000;
+  return rows.map((row) => {
+    const lastActiveValue = row.last_active_at ? new Date(row.last_active_at).getTime() : 0;
+    const isOnline = row.online_status === 1 && lastActiveValue >= threshold;
+    return {
+      ...row,
+      online_status: isOnline ? 1 : 0
+    };
+  });
 };

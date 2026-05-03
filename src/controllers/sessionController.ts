@@ -6,6 +6,7 @@ import {
   deleteSessionForUser,
   getSessionDetailForUser,
   getUserSessionList,
+  heartbeatSessionForUser,
   joinSessionForUser,
   leaveSessionForUser,
   SessionServiceError
@@ -216,6 +217,28 @@ export const leaveSession = async (req: Request, res: Response): Promise<void> =
     // leave 只更新在线状态，不删除历史成员关系记录。
     await leaveSessionForUser(sessionKey, userId);
     send(res, { code: 0, message: "离开成功", data: null });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const heartbeatSession = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    await heartbeatSessionForUser(sessionKey, userId);
+    send(res, { code: 0, message: "心跳成功", data: null });
   } catch (error) {
     mapServiceError(res, error);
   }

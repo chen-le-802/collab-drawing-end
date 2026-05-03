@@ -94,6 +94,7 @@ export interface SessionVO {
   creatorName?: string;
   status: number;
   memberCount?: number;
+  onlineMemberCount?: number;
   memberPreviews?: SessionMemberPreviewVO[];
   currentVersion?: number;
   createdAt: string;
@@ -103,11 +104,13 @@ export interface SessionMemberPreviewVO {
   userId: number;
   username: string;
   avatar?: string;
+  isOnline: boolean;
 }
 
 export interface MemberVO {
   userId: number;
   username: string;
+  avatar?: string;
   role: number;
   onlineStatus: number;
   joinedAt: string;
