@@ -86,6 +86,19 @@ export interface UpdateGraphicDTO {
   zIndex?: number;
 }
 
+export type CollaborativeOperationType = "create_graphic" | "update_graphic" | "delete_graphic";
+
+export interface OperationVO {
+  operationId: number;
+  sessionId: number;
+  userId: number;
+  objectKey: string;
+  operationType: CollaborativeOperationType;
+  version: number;
+  timestamp: number;
+  data: Record<string, unknown>;
+}
+
 export interface SessionVO {
   sessionId: number;
   sessionKey: string;
