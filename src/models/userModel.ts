@@ -51,3 +51,10 @@ export const updateUserProfileById = async (
     [username, avatar, userId]
   );
 };
+
+export const updateUserPasswordById = async (userId: number, passwordHash: string): Promise<void> => {
+  await dbPool.execute<ResultSetHeader>(
+    "UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?",
+    [passwordHash, userId]
+  );
+};

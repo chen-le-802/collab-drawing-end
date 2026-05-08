@@ -22,6 +22,7 @@ import {
 import { findUserById } from "../models/userModel";
 import { graphicService, GraphicServiceError } from "../services/graphicService";
 import { getSessionDetailForUser, SessionServiceError } from "../services/sessionService";
+import { undoService, UndoServiceError } from "../services/undoService";
 import { MemberVO } from "../types";
 import {
   AuthedWebSocket,
@@ -39,21 +40,18 @@ import {
 } from "./types";
 
 type OperationType = "create" | "update" | "delete";
-type UndoIntent = "undo" | "redo";
-
-type UndoStrategy = "delete_created" | "restore_deleted" | "restore_updated";
 
 type WsErrorCode = 1001 | 2001 | 2002 | 3001 | 3002 | 4001;
 
 type OperationDataPayload = {
-  objectType: "line" | "rect" | "circle" | "text";
+  objectType: "line" | "rect" | "circle" | "text" | "path";
   before: GraphicSnapshot | null;
   after: GraphicSnapshot | null;
 };
 
 type GraphicSnapshot = {
   objectKey: string;
-  objectType: "line" | "rect" | "circle" | "text";
+  objectType: "line" | "rect" | "circle" | "text" | "path";
   positionX: number;
   positionY: number;
   width: number | null;
@@ -64,30 +62,7 @@ type GraphicSnapshot = {
   zIndex: number;
   textContent: string | null;
   fontSize: number | null;
-};
-
-type OperationRow = RowDataPacket & {
-  id: number;
-  session_id: number;
-  user_id: number;
-  object_key: string;
-  operation_type: OperationType;
-  operation_data: string | OperationDataPayload;
-  version: number | string;
-  timestamp: number;
-  undoable: number;
-  redoable: number;
-};
-
-type UserOperationHistoryRow = RowDataPacket & {
-  id: number;
-  user_id: number;
-  session_id: number;
-  operation_id: number;
-  undo_operation_id: number | null;
-  can_undo: number;
-  can_redo: number;
-  created_at: Date | string;
+  pathPoints: Array<{ x: number; y: number }> | null;
 };
 
 type WsContext = {
@@ -104,6 +79,21 @@ const toNumber = (value: unknown): number => {
 };
 
 const toGraphicSnapshot = (row: GraphicRow): GraphicSnapshot => {
+  let pathPoints: Array<{ x: number; y: number }> | null = null;
+  if (typeof row.path_points === "string" && row.path_points.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(row.path_points) as unknown;
+      if (Array.isArray(parsed)) {
+        const points = parsed
+          .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+          .map((item) => ({ x: toNumber(item.x), y: toNumber(item.y) }))
+          .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y));
+        pathPoints = points.length > 0 ? points : null;
+      }
+    } catch (_error) {
+      pathPoints = null;
+    }
+  }
   return {
     objectKey: row.object_key,
     objectType: row.object_type,
@@ -116,7 +106,8 @@ const toGraphicSnapshot = (row: GraphicRow): GraphicSnapshot => {
     strokeWidth: toNumber(row.stroke_width),
     zIndex: row.z_index,
     textContent: row.text_content,
-    fontSize: row.font_size
+    fontSize: row.font_size,
+    pathPoints
   };
 };
 
@@ -303,167 +294,6 @@ const insertUserOperationHistory = async (
   );
 };
 
-const findLatestUndoHistory = async (
-  connection: PoolConnection,
-  userId: number,
-  sessionId: number
-): Promise<(UserOperationHistoryRow & { operation_type: OperationType; operation_data: string | OperationDataPayload; object_key: string }) | null> => {
-  const [rows] = await connection.query<Array<UserOperationHistoryRow & {
-    operation_type: OperationType;
-    operation_data: string | OperationDataPayload;
-    object_key: string;
-  }>>(
-    `SELECT h.id, h.user_id, h.session_id, h.operation_id, h.undo_operation_id, h.can_undo, h.can_redo, h.created_at,
-            o.operation_type, o.operation_data, o.object_key
-     FROM user_operation_history h
-     INNER JOIN operations o ON o.id = h.operation_id
-     WHERE h.user_id = ? AND h.session_id = ? AND h.can_undo = 1
-     ORDER BY h.id DESC
-     LIMIT 1
-     FOR UPDATE`,
-    [userId, sessionId]
-  );
-  return rows[0] ?? null;
-};
-
-const findLatestRedoHistory = async (
-  connection: PoolConnection,
-  userId: number,
-  sessionId: number
-): Promise<(UserOperationHistoryRow & { operation_type: OperationType; operation_data: string | OperationDataPayload; object_key: string }) | null> => {
-  const [rows] = await connection.query<Array<UserOperationHistoryRow & {
-    operation_type: OperationType;
-    operation_data: string | OperationDataPayload;
-    object_key: string;
-  }>>(
-    `SELECT h.id, h.user_id, h.session_id, h.operation_id, h.undo_operation_id, h.can_undo, h.can_redo, h.created_at,
-            o.operation_type, o.operation_data, o.object_key
-     FROM user_operation_history h
-     INNER JOIN operations o ON o.id = h.operation_id
-     WHERE h.user_id = ? AND h.session_id = ? AND h.can_redo = 1
-     ORDER BY h.id DESC
-     LIMIT 1
-     FOR UPDATE`,
-    [userId, sessionId]
-  );
-  return rows[0] ?? null;
-};
-
-const parseOperationData = (value: string | OperationDataPayload): OperationDataPayload | null => {
-  if (typeof value === "string") {
-    try {
-      return JSON.parse(value) as OperationDataPayload;
-    } catch (_error) {
-      return null;
-    }
-  }
-  return value;
-};
-
-const applySnapshotAsCreate = async (
-  connection: PoolConnection,
-  sessionId: number,
-  userId: number,
-  snapshot: GraphicSnapshot,
-  version: number
-): Promise<void> => {
-  await insertGraphicObject(
-    {
-      sessionId,
-      objectKey: snapshot.objectKey,
-      objectType: snapshot.objectType,
-      positionX: snapshot.positionX,
-      positionY: snapshot.positionY,
-      width: snapshot.width,
-      height: snapshot.height,
-      strokeColor: snapshot.strokeColor,
-      fillColor: snapshot.fillColor,
-      strokeWidth: snapshot.strokeWidth,
-      textContent: snapshot.textContent,
-      fontSize: snapshot.fontSize,
-      zIndex: snapshot.zIndex,
-      version,
-      creatorId: userId
-    },
-    connection
-  );
-};
-
-const applySnapshotAsUpdate = async (
-  connection: PoolConnection,
-  graphicId: number,
-  snapshot: GraphicSnapshot,
-  version: number
-): Promise<void> => {
-  await updateGraphicObjectById(
-    graphicId,
-    {
-      positionX: snapshot.positionX,
-      positionY: snapshot.positionY,
-      width: snapshot.width,
-      height: snapshot.height,
-      strokeColor: snapshot.strokeColor,
-      fillColor: snapshot.fillColor,
-      strokeWidth: snapshot.strokeWidth,
-      textContent: snapshot.textContent,
-      fontSize: snapshot.fontSize,
-      zIndex: snapshot.zIndex
-    },
-    version,
-    connection
-  );
-};
-
-const resolveUndoStrategy = (operationType: OperationType): UndoStrategy => {
-  if (operationType === "create") {
-    return "delete_created";
-  }
-  if (operationType === "delete") {
-    return "restore_deleted";
-  }
-  return "restore_updated";
-};
-
-const buildUndoBroadcastPayload = (
-  sourceOperationType: OperationType,
-  objectKey: string,
-  graphic: GraphicRow | null
-): { messageType: ServerMessageType; data: unknown } => {
-  if (sourceOperationType === "create") {
-    return {
-      messageType: "graphic_deleted",
-      data: { objectKey }
-    };
-  }
-
-  if (!graphic) {
-    return {
-      messageType: "graphic_deleted",
-      data: { objectKey }
-    };
-  }
-
-  const data = {
-    objectKey: graphic.object_key,
-    objectType: graphic.object_type,
-    positionX: toNumber(graphic.position_x),
-    positionY: toNumber(graphic.position_y),
-    width: graphic.width === null ? null : toNumber(graphic.width),
-    height: graphic.height === null ? null : toNumber(graphic.height),
-    strokeColor: graphic.stroke_color,
-    fillColor: graphic.fill_color,
-    strokeWidth: toNumber(graphic.stroke_width),
-    zIndex: graphic.z_index,
-    textContent: graphic.text_content,
-    fontSize: graphic.font_size,
-    version: toNumber(graphic.version)
-  };
-
-  return {
-    messageType: sourceOperationType === "delete" ? "graphic_created" : "graphic_updated",
-    data
-  };
-};
 
 const mapBusinessError = (error: unknown): { code: WsErrorCode; message: string } => {
   if (error instanceof SessionServiceError) {
@@ -487,6 +317,18 @@ const mapBusinessError = (error: unknown): { code: WsErrorCode; message: string 
     }
     if (error.code === "SESSION_FORBIDDEN") {
       return { code: 2001, message: "无会话访问权限" };
+    }
+  }
+
+  if (error instanceof UndoServiceError) {
+    if (error.code === "SESSION_NOT_FOUND" || error.code === "GRAPHIC_NOT_FOUND") {
+      return { code: 3001, message: error.message };
+    }
+    if (error.code === "NO_UNDOABLE_OPERATION" || error.code === "NO_REDOABLE_OPERATION") {
+      return { code: 2002, message: error.message };
+    }
+    if (error.code === "BROKEN_OPERATION_DATA") {
+      return { code: 4001, message: error.message };
     }
   }
 
@@ -580,7 +422,8 @@ const onCreateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
     strokeWidth: payload.strokeWidth,
     zIndex: payload.zIndex,
     textContent: payload.textContent,
-    fontSize: payload.fontSize
+    fontSize: payload.fontSize,
+    pathPoints: payload.pathPoints
   });
 
   const connection = await dbPool.getConnection();
@@ -601,7 +444,8 @@ const onCreateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
         strokeWidth: created.strokeWidth,
         zIndex: created.zIndex,
         textContent: created.textContent,
-        fontSize: created.fontSize
+        fontSize: created.fontSize,
+        pathPoints: created.pathPoints
       }
     };
     const operationId = await insertOperation(
@@ -650,7 +494,8 @@ const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
     strokeWidth: payload.strokeWidth,
     zIndex: payload.zIndex,
     textContent: payload.textContent,
-    fontSize: payload.fontSize
+    fontSize: payload.fontSize,
+    pathPoints: payload.pathPoints
   });
 
   const connection = await dbPool.getConnection();
@@ -671,7 +516,8 @@ const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
         strokeWidth: updated.strokeWidth,
         zIndex: updated.zIndex,
         textContent: updated.textContent,
-        fontSize: updated.fontSize
+        fontSize: updated.fontSize,
+        pathPoints: updated.pathPoints
       }
     };
     const operationId = await insertOperation(
@@ -763,230 +609,6 @@ const resolveUndoRedoState = async (
   };
 };
 
-const runUndoOrRedo = async (
-  context: WsContext,
-  ws: AuthedWebSocket,
-  sessionKey: string,
-  sessionId: number,
-  intent: UndoIntent
-): Promise<void> => {
-  const connection = await dbPool.getConnection();
-  try {
-    await connection.beginTransaction();
-
-    const targetHistory = intent === "undo"
-      ? await findLatestUndoHistory(connection, ws.clientData.userId, sessionId)
-      : await findLatestRedoHistory(connection, ws.clientData.userId, sessionId);
-
-    if (!targetHistory) {
-      throw new Error(intent === "undo" ? "无可撤销操作" : "无可重做操作");
-    }
-
-    const operationData = parseOperationData(targetHistory.operation_data);
-    if (!operationData) {
-      throw new Error("操作记录损坏");
-    }
-
-    const sourceOperationType = targetHistory.operation_type;
-    const strategy = resolveUndoStrategy(sourceOperationType);
-    const nextVersion = await incrementSessionVersion(sessionId, connection);
-    if (nextVersion === null) {
-      throw new SessionServiceError("SESSION_NOT_FOUND", "会话不存在");
-    }
-
-    const objectKey = targetHistory.object_key;
-    const currentGraphic = await findGraphicByObjectKey(sessionId, objectKey, true, connection);
-    let restoredGraphic: GraphicRow | null = null;
-    let inverseOperationType: OperationType;
-    let inverseOperationData: OperationDataPayload;
-
-    if (intent === "undo") {
-      if (strategy === "delete_created") {
-        if (!currentGraphic || currentGraphic.is_deleted === 1) {
-          throw new Error("图形对象不存在");
-        }
-        await softDeleteGraphicById(currentGraphic.id, nextVersion, connection);
-        inverseOperationType = "delete";
-        inverseOperationData = {
-          objectType: currentGraphic.object_type,
-          before: toGraphicSnapshot(currentGraphic),
-          after: null
-        };
-      } else if (strategy === "restore_deleted") {
-        const restore = operationData.before;
-        if (!restore) {
-          throw new Error("操作数据缺失");
-        }
-        if (currentGraphic && currentGraphic.is_deleted === 0) {
-          await applySnapshotAsUpdate(connection, currentGraphic.id, restore, nextVersion);
-        } else if (currentGraphic && currentGraphic.is_deleted === 1) {
-          await connection.execute(
-            `UPDATE graphic_objects
-             SET is_deleted = 0, object_type = ?, position_x = ?, position_y = ?, width = ?, height = ?,
-                 stroke_color = ?, fill_color = ?, stroke_width = ?, z_index = ?, text_content = ?, font_size = ?,
-                 version = ?, updated_at = NOW()
-             WHERE id = ?`,
-            [
-              restore.objectType,
-              restore.positionX,
-              restore.positionY,
-              restore.width,
-              restore.height,
-              restore.strokeColor,
-              restore.fillColor,
-              restore.strokeWidth,
-              restore.zIndex,
-              restore.textContent,
-              restore.fontSize,
-              nextVersion,
-              currentGraphic.id
-            ]
-          );
-        } else {
-          await applySnapshotAsCreate(connection, sessionId, ws.clientData.userId, restore, nextVersion);
-        }
-
-        restoredGraphic = await findGraphicByObjectKey(sessionId, objectKey, true, connection);
-        inverseOperationType = "create";
-        inverseOperationData = {
-          objectType: restore.objectType,
-          before: null,
-          after: restore
-        };
-      } else {
-        const restore = operationData.before;
-        if (!restore || !currentGraphic || currentGraphic.is_deleted === 1) {
-          throw new Error("图形对象不存在");
-        }
-        await applySnapshotAsUpdate(connection, currentGraphic.id, restore, nextVersion);
-        restoredGraphic = await findGraphicByObjectKey(sessionId, objectKey, true, connection);
-        inverseOperationType = "update";
-        inverseOperationData = {
-          objectType: restore.objectType,
-          before: operationData.after,
-          after: restore
-        };
-      }
-
-      const undoOperationId = await insertOperation(
-        connection,
-        sessionId,
-        ws.clientData.userId,
-        objectKey,
-        inverseOperationType,
-        inverseOperationData,
-        nextVersion
-      );
-      await connection.execute(
-        "UPDATE user_operation_history SET can_undo = 0, can_redo = 1, undo_operation_id = ? WHERE id = ?",
-        [undoOperationId, targetHistory.id]
-      );
-
-      const state = await resolveUndoRedoState(connection, ws.clientData.userId, sessionId);
-      await connection.commit();
-
-      const { messageType, data } = buildUndoBroadcastPayload(sourceOperationType, objectKey, restoredGraphic);
-      broadcastRoom(context, sessionKey, messageType, data, ws);
-      safeSend(ws, "undo_result", {
-        sessionKey,
-        operationId: targetHistory.operation_id,
-        undoOperationId,
-        canUndo: state.canUndo,
-        canRedo: state.canRedo
-      });
-      return;
-    }
-
-    const redoSourceOperation = await connection.query<OperationRow[]>(
-      "SELECT id, session_id, user_id, object_key, operation_type, operation_data, version, timestamp, undoable, redoable FROM operations WHERE id = ? LIMIT 1",
-      [targetHistory.undo_operation_id]
-    );
-    const redoOperation = redoSourceOperation[0][0];
-    if (!redoOperation) {
-      throw new Error("重做操作不存在");
-    }
-    const redoData = parseOperationData(redoOperation.operation_data);
-    if (!redoData) {
-      throw new Error("重做操作数据损坏");
-    }
-
-    if (redoOperation.operation_type === "delete") {
-      if (!currentGraphic || currentGraphic.is_deleted === 1) {
-        throw new Error("图形对象不存在");
-      }
-      await softDeleteGraphicById(currentGraphic.id, nextVersion, connection);
-    } else if (redoOperation.operation_type === "create") {
-      const snapshot = redoData.after;
-      if (!snapshot) {
-        throw new Error("重做操作数据缺失");
-      }
-      if (currentGraphic && currentGraphic.is_deleted === 1) {
-        await connection.execute(
-          `UPDATE graphic_objects
-           SET is_deleted = 0, object_type = ?, position_x = ?, position_y = ?, width = ?, height = ?,
-               stroke_color = ?, fill_color = ?, stroke_width = ?, z_index = ?, text_content = ?, font_size = ?,
-               version = ?, updated_at = NOW()
-           WHERE id = ?`,
-          [
-            snapshot.objectType,
-            snapshot.positionX,
-            snapshot.positionY,
-            snapshot.width,
-            snapshot.height,
-            snapshot.strokeColor,
-            snapshot.fillColor,
-            snapshot.strokeWidth,
-            snapshot.zIndex,
-            snapshot.textContent,
-            snapshot.fontSize,
-            nextVersion,
-            currentGraphic.id
-          ]
-        );
-      } else if (!currentGraphic) {
-        await applySnapshotAsCreate(connection, sessionId, ws.clientData.userId, snapshot, nextVersion);
-      } else {
-        await applySnapshotAsUpdate(connection, currentGraphic.id, snapshot, nextVersion);
-      }
-    } else {
-      const snapshot = redoData.after;
-      if (!snapshot || !currentGraphic || currentGraphic.is_deleted === 1) {
-        throw new Error("图形对象不存在");
-      }
-      await applySnapshotAsUpdate(connection, currentGraphic.id, snapshot, nextVersion);
-    }
-
-    await connection.execute(
-      "UPDATE user_operation_history SET can_undo = 1, can_redo = 0 WHERE id = ?",
-      [targetHistory.id]
-    );
-
-    const afterGraphic = await findGraphicByObjectKey(sessionId, objectKey, true, connection);
-    const state = await resolveUndoRedoState(connection, ws.clientData.userId, sessionId);
-    await connection.commit();
-
-    if (redoOperation.operation_type === "delete") {
-      broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey }, ws);
-    } else if (redoOperation.operation_type === "create") {
-      broadcastRoom(context, sessionKey, "graphic_created", afterGraphic, ws);
-    } else {
-      broadcastRoom(context, sessionKey, "graphic_updated", afterGraphic, ws);
-    }
-
-    safeSend(ws, "redo_result", {
-      sessionKey,
-      operationId: targetHistory.operation_id,
-      redoOperationId: targetHistory.undo_operation_id,
-      canUndo: state.canUndo,
-      canRedo: state.canRedo
-    });
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
-  }
-};
 
 const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedoData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
@@ -995,7 +617,40 @@ const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     return;
   }
   const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
-  await runUndoOrRedo(context, ws, sessionKey, sessionId, "undo");
+  const result = await undoService.undo(sessionId, ws.clientData.userId);
+  if (!result.success) {
+    sendError(ws, "undo", 4001, "撤销失败");
+    return;
+  }
+
+  const connection = await dbPool.getConnection();
+  let state: { canUndo: boolean; canRedo: boolean } = { canUndo: false, canRedo: false };
+  try {
+    state = await resolveUndoRedoState(connection, ws.clientData.userId, sessionId);
+  } finally {
+    connection.release();
+  }
+
+  if (result.operation) {
+    if (result.operation.operationType === "create_graphic") {
+      broadcastRoom(context, sessionKey, "graphic_created", result.operation.data, ws);
+    } else if (result.operation.operationType === "update_graphic") {
+      broadcastRoom(context, sessionKey, "graphic_updated", result.operation.data, ws);
+    } else {
+      broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: result.operation.objectKey }, ws);
+    }
+  }
+
+  safeSend(ws, "undo_result", {
+    success: true,
+    sessionKey,
+    operation: result.operation,
+    currentVersion: result.currentVersion,
+    operationId: result.operation?.operationId ?? 0,
+    undoOperationId: result.operation?.operationId ?? 0,
+    canUndo: state.canUndo,
+    canRedo: state.canRedo
+  });
 };
 
 const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedoData): Promise<void> => {
@@ -1005,7 +660,40 @@ const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     return;
   }
   const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
-  await runUndoOrRedo(context, ws, sessionKey, sessionId, "redo");
+  const result = await undoService.redo(sessionId, ws.clientData.userId);
+  if (!result.success) {
+    sendError(ws, "redo", 4001, "重做失败");
+    return;
+  }
+
+  const connection = await dbPool.getConnection();
+  let state: { canUndo: boolean; canRedo: boolean } = { canUndo: false, canRedo: false };
+  try {
+    state = await resolveUndoRedoState(connection, ws.clientData.userId, sessionId);
+  } finally {
+    connection.release();
+  }
+
+  if (result.operation) {
+    if (result.operation.operationType === "create_graphic") {
+      broadcastRoom(context, sessionKey, "graphic_created", result.operation.data, ws);
+    } else if (result.operation.operationType === "update_graphic") {
+      broadcastRoom(context, sessionKey, "graphic_updated", result.operation.data, ws);
+    } else {
+      broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: result.operation.objectKey }, ws);
+    }
+  }
+
+  safeSend(ws, "redo_result", {
+    success: true,
+    sessionKey,
+    operation: result.operation,
+    currentVersion: result.currentVersion,
+    operationId: result.operation?.operationId ?? 0,
+    redoOperationId: result.operation?.operationId ?? 0,
+    canUndo: state.canUndo,
+    canRedo: state.canRedo
+  });
 };
 
 const onPing = (ws: AuthedWebSocket): void => {

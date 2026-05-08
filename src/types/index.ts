@@ -35,7 +35,12 @@ export interface AuthPayload {
   userId: number;
 }
 
-export type GraphicObjectType = "line" | "rect" | "circle" | "text";
+export type GraphicObjectType = "line" | "rect" | "circle" | "text" | "path";
+
+export interface PathPoint {
+  x: number;
+  y: number;
+}
 
 export interface GraphicVO {
   id: number;
@@ -51,6 +56,7 @@ export interface GraphicVO {
   strokeWidth: number;
   textContent: string | null;
   fontSize: number | null;
+  pathPoints: PathPoint[] | null;
   zIndex: number;
   version: number;
   creatorId: number;
@@ -70,6 +76,7 @@ export interface CreateGraphicDTO {
   strokeWidth: number;
   textContent?: string;
   fontSize?: number;
+  pathPoints?: PathPoint[];
   zIndex: number;
 }
 
@@ -83,6 +90,7 @@ export interface UpdateGraphicDTO {
   strokeWidth?: number;
   textContent?: string;
   fontSize?: number;
+  pathPoints?: PathPoint[];
   zIndex?: number;
 }
 

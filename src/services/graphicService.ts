@@ -20,7 +20,7 @@ type GraphicsResult = {
   currentVersion: number;
 };
 
-const GRAPHIC_TYPES: GraphicObjectType[] = ["line", "rect", "circle", "text"];
+const GRAPHIC_TYPES: GraphicObjectType[] = ["line", "rect", "circle", "text", "path"];
 
 // 统一图形模块业务异常，controller 根据 code 映射 API 错误码。
 export class GraphicServiceError extends Error {
@@ -50,6 +50,32 @@ const toIsoString = (value: Date | string): string => {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 };
 
+const parsePathPoints = (value: unknown): Array<{ x: number; y: number }> | null => {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    const points = parsed
+      .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+      .map((item) => ({ x: toNumber(item.x), y: toNumber(item.y) }))
+      .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y));
+    return points.length > 0 ? points : null;
+  } catch (_error) {
+    return null;
+  }
+};
+
+const toPathPointsJson = (points: Array<{ x: number; y: number }> | undefined): string | null => {
+  if (!Array.isArray(points) || points.length === 0) {
+    return null;
+  }
+  return JSON.stringify(points);
+};
+
 // 数据库行到 VO 的统一映射，避免字段转换散落在业务流程中。
 const toGraphicVO = (row: GraphicRow): GraphicVO => {
   return {
@@ -66,6 +92,7 @@ const toGraphicVO = (row: GraphicRow): GraphicVO => {
     strokeWidth: toNumber(row.stroke_width),
     textContent: row.text_content,
     fontSize: row.font_size,
+    pathPoints: parsePathPoints(row.path_points),
     zIndex: row.z_index,
     version: toNumber(row.version),
     creatorId: row.creator_id,
@@ -138,6 +165,23 @@ const normalizeCreateGraphicData = (data: CreateGraphicDTO): CreateGraphicDTO =>
   if (typeof data.fontSize !== "undefined") {
     assertFiniteNumber(data.fontSize, "fontSize");
   }
+  if (typeof data.pathPoints !== "undefined") {
+    if (!Array.isArray(data.pathPoints)) {
+      throw new GraphicServiceError("INVALID_ARGUMENT", "pathPoints 参数错误");
+    }
+    data.pathPoints.forEach((point, index) => {
+      if (
+        !point ||
+        typeof point !== "object" ||
+        typeof point.x !== "number" ||
+        !Number.isFinite(point.x) ||
+        typeof point.y !== "number" ||
+        !Number.isFinite(point.y)
+      ) {
+        throw new GraphicServiceError("INVALID_ARGUMENT", `pathPoints[${index}] 参数错误`);
+      }
+    });
+  }
 
   return data;
 };
@@ -179,6 +223,23 @@ const normalizeUpdateGraphicData = (data: UpdateGraphicDTO): UpdateGraphicDTO =>
   if (typeof data.zIndex !== "undefined") {
     assertFiniteNumber(data.zIndex, "zIndex");
   }
+  if (typeof data.pathPoints !== "undefined") {
+    if (!Array.isArray(data.pathPoints)) {
+      throw new GraphicServiceError("INVALID_ARGUMENT", "pathPoints 参数错误");
+    }
+    data.pathPoints.forEach((point, index) => {
+      if (
+        !point ||
+        typeof point !== "object" ||
+        typeof point.x !== "number" ||
+        !Number.isFinite(point.x) ||
+        typeof point.y !== "number" ||
+        !Number.isFinite(point.y)
+      ) {
+        throw new GraphicServiceError("INVALID_ARGUMENT", `pathPoints[${index}] 参数错误`);
+      }
+    });
+  }
 
   return data;
 };
@@ -215,6 +276,7 @@ const graphicServiceImpl: GraphicService = {
           strokeWidth: normalizedData.strokeWidth,
           textContent: typeof normalizedData.textContent === "string" ? normalizedData.textContent : null,
           fontSize: typeof normalizedData.fontSize === "number" ? normalizedData.fontSize : null,
+          pathPoints: toPathPointsJson(normalizedData.pathPoints),
           zIndex: normalizedData.zIndex,
           version: nextVersion,
           creatorId: userId
@@ -267,6 +329,9 @@ const graphicServiceImpl: GraphicService = {
           strokeWidth: normalizedData.strokeWidth,
           textContent: typeof normalizedData.textContent === "string" ? normalizedData.textContent : undefined,
           fontSize: typeof normalizedData.fontSize === "number" ? normalizedData.fontSize : undefined,
+          pathPoints: Array.isArray(normalizedData.pathPoints)
+            ? JSON.stringify(normalizedData.pathPoints)
+            : undefined,
           zIndex: normalizedData.zIndex
         },
         nextVersion,

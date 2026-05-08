@@ -4,7 +4,14 @@ import jwt from "jsonwebtoken";
 import { env } from "../config/env";
 import { UpdateProfileDTO, UserVO } from "../types";
 import { createAuthToken, deleteAuthTokensByUserId, findAuthTokenByToken } from "../models/authTokenModel";
-import { createUser, findUserById, findUserByUsername, updateUserProfileById, UserRow } from "../models/userModel";
+import {
+  createUser,
+  findUserById,
+  findUserByUsername,
+  updateUserPasswordById,
+  updateUserProfileById,
+  UserRow
+} from "../models/userModel";
 
 const BCRYPT_ROUNDS = 10;
 const JWT_EXPIRES_SECONDS = 24 * 60 * 60;
@@ -94,6 +101,26 @@ export const updateProfile = async (userId: number, payload: UpdateProfileDTO): 
   }
 
   return toUserVO(updatedUser);
+};
+
+export const changePassword = async (userId: number, currentPassword: string, newPassword: string): Promise<void> => {
+  const user = await findUserById(userId);
+  if (!user) {
+    throw new UserServiceError("USER_NOT_FOUND", "未登录");
+  }
+
+  const isPasswordCorrect = await bcrypt.compare(currentPassword, user.password);
+  if (!isPasswordCorrect) {
+    throw new UserServiceError("UNAUTHORIZED", "当前密码错误");
+  }
+
+  const isSamePassword = await bcrypt.compare(newPassword, user.password);
+  if (isSamePassword) {
+    throw new UserServiceError("UNAUTHORIZED", "新密码不能与当前密码相同");
+  }
+
+  const nextPasswordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+  await updateUserPasswordById(userId, nextPasswordHash);
 };
 
 export const getAuthTokenByToken = findAuthTokenByToken;

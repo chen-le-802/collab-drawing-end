@@ -29,7 +29,7 @@ export interface LeaveSessionData {
 export interface CreateGraphicData {
   sessionKey: string;
   objectKey: string;
-  objectType: "line" | "rect" | "circle" | "text";
+  objectType: "line" | "rect" | "circle" | "text" | "path";
   positionX: number;
   positionY: number;
   width?: number;
@@ -40,6 +40,7 @@ export interface CreateGraphicData {
   zIndex: number;
   textContent?: string;
   fontSize?: number;
+  pathPoints?: Array<{ x: number; y: number }>;
 }
 
 export interface UpdateGraphicData {
@@ -55,6 +56,7 @@ export interface UpdateGraphicData {
   zIndex?: number;
   textContent?: string;
   fontSize?: number;
+  pathPoints?: Array<{ x: number; y: number }>;
 }
 
 export interface DeleteGraphicData {

@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { ApiResponse, UpdateProfileDTO } from "../types";
 import {
+  changePassword,
   getCurrentUser,
   loginUser,
   removeAuthTokenByUserId,
@@ -258,4 +259,46 @@ export const uploadAvatar = async (req: Request, res: Response): Promise<void> =
     message: "success",
     data: { url: avatarUrl }
   });
+};
+
+export const postChangePassword = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const { currentPassword, newPassword } = req.body as {
+      currentPassword?: unknown;
+      newPassword?: unknown;
+    };
+
+    if (!isValidPassword(currentPassword) || !isValidPassword(newPassword)) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    if (currentPassword === newPassword) {
+      send(res, { code: 1001, message: "新密码不能与当前密码相同", data: null });
+      return;
+    }
+
+    await changePassword(userId, currentPassword, newPassword);
+    send(res, { code: 0, message: "success", data: null });
+  } catch (error) {
+    if (error instanceof UserServiceError) {
+      if (error.code === "USER_NOT_FOUND") {
+        send(res, { code: 2001, message: "未登录", data: null });
+        return;
+      }
+      if (error.code === "UNAUTHORIZED") {
+        send(res, { code: 2003, message: error.message || "当前密码错误", data: null });
+        return;
+      }
+    }
+    send(res, { code: 4001, message: "服务器错误", data: null });
+  }
 };
