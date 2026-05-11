@@ -13,6 +13,7 @@ import {
   transferSessionCreatorForUser,
   SessionServiceError
 } from "../services/sessionService";
+import { operationService, OperationServiceError } from "../services/operationService";
 
 type AuthRequest = Request & {
   user?: {
@@ -89,8 +90,39 @@ const parseBooleanFlag = (value: unknown): boolean | null => {
   return null;
 };
 
+const parseNonNegativeInteger = (value: unknown): number | null => {
+  if (typeof value === "undefined") {
+    return null;
+  }
+  const normalized = Array.isArray(value) ? value[0] : value;
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    return null;
+  }
+  return parsed;
+};
+
 // controller 统一做 service -> API 错误码映射，保证响应结构稳定。
 const mapServiceError = (res: Response, error: unknown): void => {
+  if (error instanceof OperationServiceError) {
+    if (error.code === "INVALID_ARGUMENT") {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (error.code === "SESSION_NOT_FOUND" || error.code === "GRAPHIC_NOT_FOUND") {
+      send(res, { code: 3001, message: "资源不存在", data: null });
+      return;
+    }
+    if (error.code === "GRAPHIC_EXISTS") {
+      send(res, { code: 3002, message: "资源已存在", data: null });
+      return;
+    }
+    if (error.code === "SESSION_FORBIDDEN") {
+      send(res, { code: 2003, message: "无会话访问权限", data: null });
+      return;
+    }
+  }
+
   if (error instanceof SessionServiceError) {
     if (error.code === "SESSION_NOT_FOUND") {
       send(res, { code: 3001, message: "会话不存在", data: null });
@@ -103,6 +135,268 @@ const mapServiceError = (res: Response, error: unknown): void => {
   }
 
   send(res, { code: 4001, message: "服务器错误", data: null });
+};
+
+export const getSessionOperations = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const sinceVersion = parseNonNegativeInteger(req.query.sinceVersion);
+    if (typeof req.query.sinceVersion !== "undefined" && sinceVersion === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await operationService.getSessionOperationsBySessionKey(sessionKey, userId, sinceVersion ?? 0);
+    send(res, { code: 0, message: "获取成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+const parseOperationType = (value: unknown): "create" | "update" | "delete" | null => {
+  if (typeof value === "undefined") {
+    return null;
+  }
+  const normalized = Array.isArray(value) ? value[0] : value;
+  if (normalized === "create" || normalized === "update" || normalized === "delete") {
+    return normalized;
+  }
+  return null;
+};
+
+const parseConflictType = (
+  value: unknown
+): "none" | "field_merge" | "field_conflict" | "delete_wins" | "duplicate_operation" | null => {
+  if (typeof value === "undefined") {
+    return null;
+  }
+  const normalized = Array.isArray(value) ? value[0] : value;
+  if (
+    normalized === "none" ||
+    normalized === "field_merge" ||
+    normalized === "field_conflict" ||
+    normalized === "delete_wins" ||
+    normalized === "duplicate_operation"
+  ) {
+    return normalized;
+  }
+  return null;
+};
+
+export const getSessionOperationTimeline = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const fromVersion = parseNonNegativeInteger(req.query.fromVersion);
+    const toVersion = parseNonNegativeInteger(req.query.toVersion);
+    const filterUserId = parsePositiveInteger(req.query.userId);
+    const operationType = parseOperationType(req.query.operationType);
+    const conflictType = parseConflictType(req.query.conflictType);
+    const page = parsePositiveInteger(req.query.page);
+    const pageSize = parsePositiveInteger(req.query.pageSize);
+
+    if (typeof req.query.fromVersion !== "undefined" && fromVersion === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof req.query.toVersion !== "undefined" && toVersion === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof req.query.userId !== "undefined" && filterUserId === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof req.query.operationType !== "undefined" && operationType === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof req.query.conflictType !== "undefined" && conflictType === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof req.query.page !== "undefined" && page === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof req.query.pageSize !== "undefined" && pageSize === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await operationService.getSessionOperationTimelineBySessionKey(sessionKey, userId, {
+      ...(typeof fromVersion === "number" ? { fromVersion } : {}),
+      ...(typeof toVersion === "number" ? { toVersion } : {}),
+      ...(typeof filterUserId === "number" ? { userId: filterUserId } : {}),
+      ...(operationType ? { operationType } : {}),
+      ...(conflictType ? { conflictType } : {}),
+      page: page ?? 1,
+      pageSize: pageSize ?? 20
+    });
+    send(res, { code: 0, message: "获取成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const getSessionConflictLogs = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const sinceId = parseNonNegativeInteger(req.query.sinceId);
+    const limit = parsePositiveInteger(req.query.limit);
+    if (typeof req.query.sinceId !== "undefined" && sinceId === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof req.query.limit !== "undefined" && limit === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await operationService.getSessionConflictLogsBySessionKey(
+      sessionKey,
+      userId,
+      sinceId ?? 0,
+      limit ?? 100
+    );
+    send(res, { code: 0, message: "获取成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const createSessionSnapshot = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await operationService.createSessionSnapshotBySessionKey(sessionKey, userId);
+    send(res, { code: 0, message: "创建成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const getSessionSnapshots = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    const limit = parsePositiveInteger(req.query.limit);
+    if (typeof req.query.limit !== "undefined" && limit === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await operationService.getSessionSnapshotsBySessionKey(sessionKey, userId, limit ?? 20);
+    send(res, { code: 0, message: "获取成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const getSessionReplay = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    const targetVersion = parseNonNegativeInteger(req.query.targetVersion);
+    if (targetVersion === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await operationService.getSessionReplayByVersion(sessionKey, userId, targetVersion);
+    send(res, { code: 0, message: "获取成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const restoreSessionVersion = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    const targetVersion = parseNonNegativeInteger((req.body as { targetVersion?: unknown })?.targetVersion);
+    if (targetVersion === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await operationService.restoreSessionByVersion(sessionKey, userId, targetVersion);
+    send(res, { code: 0, message: "恢复成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
 };
 
 export const createSession = async (req: Request, res: Response): Promise<void> => {

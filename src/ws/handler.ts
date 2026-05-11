@@ -1,16 +1,7 @@
-import { PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import { PoolConnection, RowDataPacket } from "mysql2/promise";
 import WebSocket from "ws";
 
 import { dbPool } from "../config/db";
-import {
-  findGraphicByObjectKey,
-  findSessionCurrentVersion,
-  GraphicRow,
-  incrementSessionVersion,
-  insertGraphicObject,
-  softDeleteGraphicById,
-  updateGraphicObjectById
-} from "../models/graphicModel";
 import {
   findSessionBySessionKey,
   findSessionMember,
@@ -21,6 +12,7 @@ import {
 } from "../models/sessionModel";
 import { findUserById } from "../models/userModel";
 import { graphicService, GraphicServiceError } from "../services/graphicService";
+import { OperationServiceError, operationService } from "../services/operationService";
 import { getSessionDetailForUser, SessionServiceError } from "../services/sessionService";
 import { undoService, UndoServiceError } from "../services/undoService";
 import { MemberVO } from "../types";
@@ -33,37 +25,14 @@ import {
   JoinSessionData,
   JoinSessionPayload,
   LeaveSessionData,
+  OperationResolvedPayload,
   ServerMessage,
   ServerMessageType,
   UndoRedoData,
   UpdateGraphicData
 } from "./types";
 
-type OperationType = "create" | "update" | "delete";
-
 type WsErrorCode = 1001 | 2001 | 2002 | 3001 | 3002 | 4001;
-
-type OperationDataPayload = {
-  objectType: "line" | "rect" | "circle" | "text" | "path";
-  before: GraphicSnapshot | null;
-  after: GraphicSnapshot | null;
-};
-
-type GraphicSnapshot = {
-  objectKey: string;
-  objectType: "line" | "rect" | "circle" | "text" | "path";
-  positionX: number;
-  positionY: number;
-  width: number | null;
-  height: number | null;
-  strokeColor: string;
-  fillColor: string | null;
-  strokeWidth: number;
-  zIndex: number;
-  textContent: string | null;
-  fontSize: number | null;
-  pathPoints: Array<{ x: number; y: number }> | null;
-};
 
 type WsContext = {
   rooms: Map<string, Set<AuthedWebSocket>>;
@@ -72,44 +41,6 @@ type WsContext = {
 
 const SESSION_KEY_REG = /^[a-f0-9]{64}$/i;
 const MAX_PAYLOAD_SIZE = 1024 * 1024;
-
-const toNumber = (value: unknown): number => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-};
-
-const toGraphicSnapshot = (row: GraphicRow): GraphicSnapshot => {
-  let pathPoints: Array<{ x: number; y: number }> | null = null;
-  if (typeof row.path_points === "string" && row.path_points.trim().length > 0) {
-    try {
-      const parsed = JSON.parse(row.path_points) as unknown;
-      if (Array.isArray(parsed)) {
-        const points = parsed
-          .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
-          .map((item) => ({ x: toNumber(item.x), y: toNumber(item.y) }))
-          .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y));
-        pathPoints = points.length > 0 ? points : null;
-      }
-    } catch (_error) {
-      pathPoints = null;
-    }
-  }
-  return {
-    objectKey: row.object_key,
-    objectType: row.object_type,
-    positionX: toNumber(row.position_x),
-    positionY: toNumber(row.position_y),
-    width: row.width === null ? null : toNumber(row.width),
-    height: row.height === null ? null : toNumber(row.height),
-    strokeColor: row.stroke_color,
-    fillColor: row.fill_color,
-    strokeWidth: toNumber(row.stroke_width),
-    zIndex: row.z_index,
-    textContent: row.text_content,
-    fontSize: row.font_size,
-    pathPoints
-  };
-};
 
 const toMemberVO = (row: SessionMemberRow): MemberVO => {
   return {
@@ -258,42 +189,6 @@ const assertSessionMemberAccess = async (sessionKey: string, userId: number): Pr
   return { sessionId: session.id };
 };
 
-const insertOperation = async (
-  connection: PoolConnection,
-  sessionId: number,
-  userId: number,
-  objectKey: string,
-  operationType: OperationType,
-  operationData: OperationDataPayload,
-  version: number
-): Promise<number> => {
-  const [result] = await connection.execute<ResultSetHeader>(
-    `INSERT INTO operations (session_id, user_id, object_key, operation_type, operation_data, version, timestamp, undoable, redoable)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)`,
-    [sessionId, userId, objectKey, operationType, JSON.stringify(operationData), version, now()]
-  );
-  return result.insertId;
-};
-
-const markRedoHistoryAsInvalid = async (connection: PoolConnection, userId: number, sessionId: number): Promise<void> => {
-  await connection.execute(
-    "UPDATE user_operation_history SET can_redo = 0 WHERE user_id = ? AND session_id = ? AND can_redo = 1",
-    [userId, sessionId]
-  );
-};
-
-const insertUserOperationHistory = async (
-  connection: PoolConnection,
-  userId: number,
-  sessionId: number,
-  operationId: number
-): Promise<void> => {
-  await connection.execute(
-    "INSERT INTO user_operation_history (user_id, session_id, operation_id, undo_operation_id, can_undo, can_redo) VALUES (?, ?, ?, NULL, 1, 0)",
-    [userId, sessionId, operationId]
-  );
-};
-
 
 const mapBusinessError = (error: unknown): { code: WsErrorCode; message: string } => {
   if (error instanceof SessionServiceError) {
@@ -306,6 +201,21 @@ const mapBusinessError = (error: unknown): { code: WsErrorCode; message: string 
   }
 
   if (error instanceof GraphicServiceError) {
+    if (error.code === "INVALID_ARGUMENT") {
+      return { code: 1001, message: "参数错误" };
+    }
+    if (error.code === "SESSION_NOT_FOUND" || error.code === "GRAPHIC_NOT_FOUND") {
+      return { code: 3001, message: "资源不存在" };
+    }
+    if (error.code === "GRAPHIC_EXISTS") {
+      return { code: 3002, message: "资源已存在" };
+    }
+    if (error.code === "SESSION_FORBIDDEN") {
+      return { code: 2001, message: "无会话访问权限" };
+    }
+  }
+
+  if (error instanceof OperationServiceError) {
     if (error.code === "INVALID_ARGUMENT") {
       return { code: 1001, message: "参数错误" };
     }
@@ -409,65 +319,47 @@ const onCreateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
   }
 
   const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
+  const result = await operationService.createGraphic(
+    sessionId,
+    ws.clientData.userId,
+    {
+      objectKey: payload.objectKey,
+      objectType: payload.objectType,
+      positionX: payload.positionX,
+      positionY: payload.positionY,
+      width: payload.width,
+      height: payload.height,
+      strokeColor: payload.strokeColor,
+      fillColor: payload.fillColor,
+      strokeWidth: payload.strokeWidth,
+      zIndex: payload.zIndex,
+      textContent: payload.textContent,
+      fontSize: payload.fontSize,
+      pathPoints: payload.pathPoints
+    },
+    {
+      operationId: payload.operationId,
+      baseVersion: payload.baseVersion,
+      lamportTime: payload.lamportTime,
+      clientId: payload.clientId
+    }
+  );
 
-  const created = await graphicService.createGraphic(sessionId, ws.clientData.userId, {
-    objectKey: payload.objectKey,
-    objectType: payload.objectType,
-    positionX: payload.positionX,
-    positionY: payload.positionY,
-    width: payload.width,
-    height: payload.height,
-    strokeColor: payload.strokeColor,
-    fillColor: payload.fillColor,
-    strokeWidth: payload.strokeWidth,
-    zIndex: payload.zIndex,
-    textContent: payload.textContent,
-    fontSize: payload.fontSize,
-    pathPoints: payload.pathPoints
-  });
+  const resolvedPayload: OperationResolvedPayload = {
+    operationId: result.resolved.operationId,
+    objectKey: result.resolved.objectKey,
+    operationType: result.resolved.operationType,
+    serverVersion: result.resolved.serverVersion,
+    conflictType: result.resolved.conflictType,
+    appliedFields: result.resolved.appliedFields,
+    rejectedFields: result.resolved.rejectedFields,
+    resolveReason: result.resolved.resolveReason
+  };
+  safeSend(ws, "operation_resolved", resolvedPayload);
 
-  const connection = await dbPool.getConnection();
-  try {
-    await connection.beginTransaction();
-    const operationData: OperationDataPayload = {
-      objectType: created.objectType,
-      before: null,
-      after: {
-        objectKey: created.objectKey,
-        objectType: created.objectType,
-        positionX: created.positionX,
-        positionY: created.positionY,
-        width: created.width,
-        height: created.height,
-        strokeColor: created.strokeColor,
-        fillColor: created.fillColor,
-        strokeWidth: created.strokeWidth,
-        zIndex: created.zIndex,
-        textContent: created.textContent,
-        fontSize: created.fontSize,
-        pathPoints: created.pathPoints
-      }
-    };
-    const operationId = await insertOperation(
-      connection,
-      sessionId,
-      ws.clientData.userId,
-      created.objectKey,
-      "create",
-      operationData,
-      created.version
-    );
-    await markRedoHistoryAsInvalid(connection, ws.clientData.userId, sessionId);
-    await insertUserOperationHistory(connection, ws.clientData.userId, sessionId, operationId);
-    await connection.commit();
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
+  if (result.graphic) {
+    broadcastRoom(context, sessionKey, "graphic_created", result.graphic, ws);
   }
-
-  broadcastRoom(context, sessionKey, "graphic_created", created, ws);
 };
 
 const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload: UpdateGraphicData): Promise<void> => {
@@ -477,69 +369,48 @@ const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
     return;
   }
 
+  const patchPayload = payload.patch ?? {};
   const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
-  const before = await findGraphicByObjectKey(sessionId, payload.objectKey, true);
-  if (!before || before.is_deleted === 1) {
-    sendError(ws, "update_graphic", 3001, "图形对象不存在");
-    return;
+  const result = await operationService.updateGraphic(
+    sessionId,
+    ws.clientData.userId,
+    payload.objectKey,
+    {
+      positionX: typeof patchPayload.positionX === "number" ? patchPayload.positionX : payload.positionX,
+      positionY: typeof patchPayload.positionY === "number" ? patchPayload.positionY : payload.positionY,
+      width: typeof patchPayload.width === "number" ? patchPayload.width : payload.width,
+      height: typeof patchPayload.height === "number" ? patchPayload.height : payload.height,
+      strokeColor: typeof patchPayload.strokeColor === "string" ? patchPayload.strokeColor : payload.strokeColor,
+      fillColor: typeof patchPayload.fillColor === "string" ? patchPayload.fillColor : payload.fillColor,
+      strokeWidth: typeof patchPayload.strokeWidth === "number" ? patchPayload.strokeWidth : payload.strokeWidth,
+      zIndex: typeof patchPayload.zIndex === "number" ? patchPayload.zIndex : payload.zIndex,
+      textContent: typeof patchPayload.textContent === "string" ? patchPayload.textContent : payload.textContent,
+      fontSize: typeof patchPayload.fontSize === "number" ? patchPayload.fontSize : payload.fontSize,
+      pathPoints: Array.isArray(patchPayload.pathPoints) ? patchPayload.pathPoints : payload.pathPoints
+    },
+    {
+      operationId: payload.operationId,
+      baseVersion: payload.baseVersion,
+      lamportTime: payload.lamportTime,
+      clientId: payload.clientId
+    }
+  );
+
+  const resolvedPayload: OperationResolvedPayload = {
+    operationId: result.resolved.operationId,
+    objectKey: result.resolved.objectKey,
+    operationType: result.resolved.operationType,
+    serverVersion: result.resolved.serverVersion,
+    conflictType: result.resolved.conflictType,
+    appliedFields: result.resolved.appliedFields,
+    rejectedFields: result.resolved.rejectedFields,
+    resolveReason: result.resolved.resolveReason
+  };
+  safeSend(ws, "operation_resolved", resolvedPayload);
+
+  if (result.graphic) {
+    broadcastRoom(context, sessionKey, "graphic_updated", result.graphic, ws);
   }
-
-  const updated = await graphicService.updateGraphic(sessionId, ws.clientData.userId, payload.objectKey, {
-    positionX: payload.positionX,
-    positionY: payload.positionY,
-    width: payload.width,
-    height: payload.height,
-    strokeColor: payload.strokeColor,
-    fillColor: payload.fillColor,
-    strokeWidth: payload.strokeWidth,
-    zIndex: payload.zIndex,
-    textContent: payload.textContent,
-    fontSize: payload.fontSize,
-    pathPoints: payload.pathPoints
-  });
-
-  const connection = await dbPool.getConnection();
-  try {
-    await connection.beginTransaction();
-    const operationData: OperationDataPayload = {
-      objectType: updated.objectType,
-      before: toGraphicSnapshot(before),
-      after: {
-        objectKey: updated.objectKey,
-        objectType: updated.objectType,
-        positionX: updated.positionX,
-        positionY: updated.positionY,
-        width: updated.width,
-        height: updated.height,
-        strokeColor: updated.strokeColor,
-        fillColor: updated.fillColor,
-        strokeWidth: updated.strokeWidth,
-        zIndex: updated.zIndex,
-        textContent: updated.textContent,
-        fontSize: updated.fontSize,
-        pathPoints: updated.pathPoints
-      }
-    };
-    const operationId = await insertOperation(
-      connection,
-      sessionId,
-      ws.clientData.userId,
-      updated.objectKey,
-      "update",
-      operationData,
-      updated.version
-    );
-    await markRedoHistoryAsInvalid(connection, ws.clientData.userId, sessionId);
-    await insertUserOperationHistory(connection, ws.clientData.userId, sessionId, operationId);
-    await connection.commit();
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
-  }
-
-  broadcastRoom(context, sessionKey, "graphic_updated", updated, ws);
 };
 
 const onDeleteGraphic = async (context: WsContext, ws: AuthedWebSocket, payload: DeleteGraphicData): Promise<void> => {
@@ -550,43 +421,33 @@ const onDeleteGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
   }
 
   const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
-  const before = await findGraphicByObjectKey(sessionId, payload.objectKey, true);
-  if (!before || before.is_deleted === 1) {
-    sendError(ws, "delete_graphic", 3001, "图形对象不存在");
-    return;
+  const result = await operationService.deleteGraphic(
+    sessionId,
+    ws.clientData.userId,
+    payload.objectKey,
+    {
+      operationId: payload.operationId,
+      baseVersion: payload.baseVersion,
+      lamportTime: payload.lamportTime,
+      clientId: payload.clientId
+    }
+  );
+
+  const resolvedPayload: OperationResolvedPayload = {
+    operationId: result.resolved.operationId,
+    objectKey: result.resolved.objectKey,
+    operationType: result.resolved.operationType,
+    serverVersion: result.resolved.serverVersion,
+    conflictType: result.resolved.conflictType,
+    appliedFields: result.resolved.appliedFields,
+    rejectedFields: result.resolved.rejectedFields,
+    resolveReason: result.resolved.resolveReason
+  };
+  safeSend(ws, "operation_resolved", resolvedPayload);
+
+  if (result.deletedObjectKey) {
+    broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: result.deletedObjectKey }, ws);
   }
-
-  await graphicService.deleteGraphic(sessionId, ws.clientData.userId, payload.objectKey);
-  const currentVersion = await findSessionCurrentVersion(sessionId);
-
-  const connection = await dbPool.getConnection();
-  try {
-    await connection.beginTransaction();
-    const operationData: OperationDataPayload = {
-      objectType: before.object_type,
-      before: toGraphicSnapshot(before),
-      after: null
-    };
-    const operationId = await insertOperation(
-      connection,
-      sessionId,
-      ws.clientData.userId,
-      payload.objectKey,
-      "delete",
-      operationData,
-      typeof currentVersion === "number" ? currentVersion : 0
-    );
-    await markRedoHistoryAsInvalid(connection, ws.clientData.userId, sessionId);
-    await insertUserOperationHistory(connection, ws.clientData.userId, sessionId, operationId);
-    await connection.commit();
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
-  }
-
-  broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: payload.objectKey }, ws);
 };
 
 const resolveUndoRedoState = async (
@@ -617,7 +478,12 @@ const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     return;
   }
   const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
-  const result = await undoService.undo(sessionId, ws.clientData.userId);
+  const result = await undoService.undo(sessionId, ws.clientData.userId, {
+    operationId: payload.operationId,
+    clientId: payload.clientId,
+    baseVersion: payload.baseVersion,
+    lamportTime: payload.lamportTime
+  });
   if (!result.success) {
     sendError(ws, "undo", 4001, "撤销失败");
     return;
@@ -641,6 +507,20 @@ const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     }
   }
 
+  if (typeof result.resolvedOperationId === "string" && result.resolvedOperationId.length > 0 && result.operation) {
+    const resolvedPayload: OperationResolvedPayload = {
+      operationId: result.resolvedOperationId,
+      objectKey: result.operation.objectKey,
+      operationType: result.operation.operationType,
+      serverVersion: result.currentVersion,
+      conflictType: "none",
+      appliedFields: [],
+      rejectedFields: [],
+      resolveReason: "undo_applied"
+    };
+    safeSend(ws, "operation_resolved", resolvedPayload);
+  }
+
   safeSend(ws, "undo_result", {
     success: true,
     sessionKey,
@@ -660,7 +540,12 @@ const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     return;
   }
   const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
-  const result = await undoService.redo(sessionId, ws.clientData.userId);
+  const result = await undoService.redo(sessionId, ws.clientData.userId, {
+    operationId: payload.operationId,
+    clientId: payload.clientId,
+    baseVersion: payload.baseVersion,
+    lamportTime: payload.lamportTime
+  });
   if (!result.success) {
     sendError(ws, "redo", 4001, "重做失败");
     return;
@@ -682,6 +567,20 @@ const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     } else {
       broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: result.operation.objectKey }, ws);
     }
+  }
+
+  if (typeof result.resolvedOperationId === "string" && result.resolvedOperationId.length > 0 && result.operation) {
+    const resolvedPayload: OperationResolvedPayload = {
+      operationId: result.resolvedOperationId,
+      objectKey: result.operation.objectKey,
+      operationType: result.operation.operationType,
+      serverVersion: result.currentVersion,
+      conflictType: "none",
+      appliedFields: [],
+      rejectedFields: [],
+      resolveReason: "redo_applied"
+    };
+    safeSend(ws, "operation_resolved", resolvedPayload);
   }
 
   safeSend(ws, "redo_result", {

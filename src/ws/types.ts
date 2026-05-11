@@ -28,6 +28,10 @@ export interface LeaveSessionData {
 
 export interface CreateGraphicData {
   sessionKey: string;
+  operationId?: string;
+  clientId?: string;
+  baseVersion?: number;
+  lamportTime?: number;
   objectKey: string;
   objectType: "line" | "rect" | "circle" | "text" | "path";
   positionX: number;
@@ -45,7 +49,24 @@ export interface CreateGraphicData {
 
 export interface UpdateGraphicData {
   sessionKey: string;
+  operationId?: string;
+  clientId?: string;
+  baseVersion?: number;
+  lamportTime?: number;
   objectKey: string;
+  patch?: {
+    positionX?: number;
+    positionY?: number;
+    width?: number;
+    height?: number;
+    strokeColor?: string;
+    fillColor?: string;
+    strokeWidth?: number;
+    zIndex?: number;
+    textContent?: string;
+    fontSize?: number;
+    pathPoints?: Array<{ x: number; y: number }>;
+  };
   positionX?: number;
   positionY?: number;
   width?: number;
@@ -61,11 +82,19 @@ export interface UpdateGraphicData {
 
 export interface DeleteGraphicData {
   sessionKey: string;
+  operationId?: string;
+  clientId?: string;
+  baseVersion?: number;
+  lamportTime?: number;
   objectKey: string;
 }
 
 export interface UndoRedoData {
   sessionKey: string;
+  operationId?: string;
+  clientId?: string;
+  baseVersion?: number;
+  lamportTime?: number;
 }
 
 export type ServerMessageType =
@@ -77,6 +106,7 @@ export type ServerMessageType =
   | "graphic_created"
   | "graphic_updated"
   | "graphic_deleted"
+  | "operation_resolved"
   | "undo_result"
   | "redo_result"
   | "error"
@@ -107,6 +137,17 @@ export type JoinSessionPayload = {
   currentVersion: number;
   members: MemberVO[];
   graphics: GraphicVO[];
+};
+
+export type OperationResolvedPayload = {
+  operationId: string;
+  objectKey: string;
+  operationType: "create_graphic" | "update_graphic" | "delete_graphic";
+  serverVersion: number;
+  conflictType: "none" | "field_merge" | "field_conflict" | "delete_wins" | "duplicate_operation";
+  appliedFields: string[];
+  rejectedFields: string[];
+  resolveReason: string;
 };
 
 export type ErrorPayload = {

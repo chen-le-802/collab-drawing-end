@@ -1,9 +1,16 @@
 import { Router } from "express";
 
 import {
+  createSessionSnapshot,
   createSession,
   deleteSession,
+  getSessionConflictLogs,
   getSessionDetail,
+  getSessionOperations,
+  getSessionOperationTimeline,
+  getSessionReplay,
+  restoreSessionVersion,
+  getSessionSnapshots,
   getSessionList,
   heartbeatSession,
   joinSession,
@@ -21,6 +28,13 @@ router.use(authMiddleware);
 router.post("/", createSession);
 router.get("/", getSessionList);
 router.get("/:sessionKey", getSessionDetail);
+router.get("/:sessionKey/operations", getSessionOperations);
+router.get("/:sessionKey/operation-timeline", getSessionOperationTimeline);
+router.get("/:sessionKey/conflicts", getSessionConflictLogs);
+router.get("/:sessionKey/snapshots", getSessionSnapshots);
+router.get("/:sessionKey/replay", getSessionReplay);
+router.post("/:sessionKey/restore-version", restoreSessionVersion);
+router.post("/:sessionKey/snapshots", createSessionSnapshot);
 router.post("/:sessionKey/join", joinSession);
 router.post("/:sessionKey/heartbeat", heartbeatSession);
 router.post("/:sessionKey/leave", leaveSession);

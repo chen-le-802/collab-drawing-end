@@ -107,6 +107,120 @@ export interface OperationVO {
   data: Record<string, unknown>;
 }
 
+export type CollaborationConflictType =
+  | "none"
+  | "field_merge"
+  | "field_conflict"
+  | "delete_wins"
+  | "duplicate_operation";
+
+export interface SessionOperationItemVO {
+  id: number;
+  operationId?: string;
+  sessionId: number;
+  userId: number;
+  objectKey: string;
+  operationType: "create" | "update" | "delete";
+  operationData: Record<string, unknown>;
+  baseVersion: number;
+  serverVersion: number;
+  lamportTime: number;
+  clientId?: string;
+  resolvedResult?: Record<string, unknown>;
+  conflictType: CollaborationConflictType;
+  timestamp: number;
+}
+
+export interface SessionOperationsSyncVO {
+  sessionId: number;
+  sessionKey: string;
+  sinceVersion: number;
+  currentVersion: number;
+  operations: SessionOperationItemVO[];
+}
+
+export interface SessionOperationTimelineQuery {
+  fromVersion?: number;
+  toVersion?: number;
+  userId?: number;
+  operationType?: "create" | "update" | "delete";
+  conflictType?: CollaborationConflictType;
+  page: number;
+  pageSize: number;
+}
+
+export interface SessionOperationTimelineVO {
+  sessionId: number;
+  sessionKey: string;
+  currentVersion: number;
+  page: number;
+  pageSize: number;
+  total: number;
+  list: SessionOperationItemVO[];
+}
+
+export interface SessionConflictLogItemVO {
+  id: number;
+  operationRefId?: number;
+  operationId?: string;
+  sessionId: number;
+  objectKey: string;
+  conflictType: CollaborationConflictType;
+  fieldName?: string;
+  currentValue?: unknown;
+  incomingValue?: unknown;
+  resolvedValue?: unknown;
+  resolveStrategy: string;
+  createdAt: string;
+}
+
+export interface SessionConflictLogsVO {
+  sessionId: number;
+  sessionKey: string;
+  sinceId: number;
+  limit: number;
+  conflicts: SessionConflictLogItemVO[];
+}
+
+export interface SessionSnapshotItemVO {
+  id: number;
+  sessionId: number;
+  version: number;
+  graphicCount: number;
+  createdBy?: number;
+  createdAt: string;
+}
+
+export interface SessionSnapshotsVO {
+  sessionId: number;
+  sessionKey: string;
+  currentVersion: number;
+  snapshots: SessionSnapshotItemVO[];
+}
+
+export interface SessionReplayVO {
+  sessionId: number;
+  sessionKey: string;
+  targetVersion: number;
+  baseSnapshot?: SessionSnapshotItemVO;
+  baseSnapshotData?: {
+    version: number;
+    graphics: Record<string, unknown>[];
+  };
+  operations: SessionOperationItemVO[];
+}
+
+export interface SessionRestoreVersionVO {
+  sessionId: number;
+  sessionKey: string;
+  targetVersion: number;
+  previousVersion: number;
+  restoredVersion: number;
+  createdCount: number;
+  updatedCount: number;
+  deletedCount: number;
+}
+
 export interface SessionVO {
   sessionId: number;
   sessionKey: string;
