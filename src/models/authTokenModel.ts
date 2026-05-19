@@ -11,6 +11,7 @@ type AuthTokenRow = RowDataPacket & {
   created_at: Date | string;
 };
 
+// 数据库字段风格(user_id/expires_at) -> 业务对象风格(userId/expiresAt)。
 const toAuthToken = (row: AuthTokenRow): AuthToken => {
   return {
     id: row.id,
@@ -22,6 +23,7 @@ const toAuthToken = (row: AuthTokenRow): AuthToken => {
 };
 
 export const createAuthToken = async (userId: number, token: string, expiresAt: Date): Promise<void> => {
+  // 登录成功后写入 token 白名单，用于后续鉴权与主动失效控制。
   await dbPool.execute<ResultSetHeader>(
     "INSERT INTO auth_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
     [userId, token, expiresAt]
@@ -38,6 +40,7 @@ export const findAuthTokenByToken = async (token: string): Promise<AuthToken | n
 };
 
 export const findValidAuthTokenByToken = async (token: string): Promise<AuthToken | null> => {
+  // 仅返回未过期 token，作为 middleware / WS 鉴权判定依据。
   const [rows] = await dbPool.query<AuthTokenRow[]>(
     "SELECT id, user_id, token, expires_at, created_at FROM auth_tokens WHERE token = ? AND expires_at > NOW() LIMIT 1",
     [token]
@@ -47,5 +50,6 @@ export const findValidAuthTokenByToken = async (token: string): Promise<AuthToke
 };
 
 export const deleteAuthTokensByUserId = async (userId: number): Promise<void> => {
+  // 退出登录或改密后可清空该用户所有登录态。
   await dbPool.execute<ResultSetHeader>("DELETE FROM auth_tokens WHERE user_id = ?", [userId]);
 };

@@ -15,8 +15,12 @@ export type SessionRow = RowDataPacket & {
   creator_name?: string | null;
   status: number;
   current_version: number;
+  is_paused: number;
   member_count?: number;
   online_member_count?: number;
+  last_operation_at?: number | string | null;
+  last_operation_user_id?: number | null;
+  last_operation_user_name?: string | null;
   created_at: Date | string;
   updated_at: Date | string;
 };
@@ -34,6 +38,20 @@ export type SessionMemberRow = RowDataPacket & {
   removed_at?: Date | string | null;
   username?: string;
   avatar?: string | null;
+};
+
+export type SessionInviteRow = RowDataPacket & {
+  id: number;
+  session_id: number;
+  invite_token: string;
+  role: number;
+  created_by: number;
+  max_uses: number | null;
+  used_count: number;
+  status: "active" | "disabled";
+  expires_at: Date | string | null;
+  created_at: Date | string;
+  updated_at: Date | string;
 };
 
 type TotalRow = RowDataPacket & {
@@ -80,7 +98,7 @@ export const insertSessionMember = async (
 export const findSessionBySessionKey = async (sessionKey: string): Promise<SessionRow | null> => {
   // 关联创建者用户名，避免上层再次查 users 表。
   const [rows] = await dbPool.query<SessionRow[]>(
-    `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at
+    `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.is_paused, s.created_at, s.updated_at
      FROM sessions s
      LEFT JOIN users u ON u.id = s.creator_id
      WHERE s.session_key = ?
@@ -88,6 +106,34 @@ export const findSessionBySessionKey = async (sessionKey: string): Promise<Sessi
     [sessionKey]
   );
   return rows[0] ?? null;
+};
+
+export const setSessionPausedStatus = async (
+  sessionId: number,
+  isPaused: number,
+  connection?: PoolConnection
+): Promise<void> => {
+  const executor = getExecutor(connection);
+  await executor.execute<ResultSetHeader>(
+    `UPDATE sessions
+     SET is_paused = ?, updated_at = NOW()
+     WHERE id = ?`,
+    [isPaused, sessionId]
+  );
+};
+
+export const setSessionStatus = async (
+  sessionId: number,
+  status: number,
+  connection?: PoolConnection
+): Promise<void> => {
+  const executor = getExecutor(connection);
+  await executor.execute<ResultSetHeader>(
+    `UPDATE sessions
+     SET status = ?, updated_at = NOW()
+     WHERE id = ?`,
+    [status, sessionId]
+  );
 };
 
 export const findSessionMember = async (sessionId: number, userId: number): Promise<SessionMemberRow | null> => {
@@ -99,6 +145,96 @@ export const findSessionMember = async (sessionId: number, userId: number): Prom
     [sessionId, userId]
   );
   return rows[0] ?? null;
+};
+
+export const insertSessionInvite = async (
+  sessionId: number,
+  inviteToken: string,
+  role: number,
+  createdBy: number,
+  maxUses: number | null,
+  expiresAt: Date | null,
+  connection?: PoolConnection
+): Promise<number> => {
+  const executor = getExecutor(connection);
+  // 邀请默认 active 且 used_count=0，后续由消费动作推进次数与状态。
+  const [result] = await executor.execute<ResultSetHeader>(
+    `INSERT INTO session_invites (session_id, invite_token, role, created_by, max_uses, used_count, status, expires_at)
+     VALUES (?, ?, ?, ?, ?, 0, 'active', ?)`,
+    [sessionId, inviteToken, role, createdBy, maxUses, expiresAt]
+  );
+  return result.insertId;
+};
+
+export const findSessionInviteByToken = async (inviteToken: string): Promise<SessionInviteRow | null> => {
+  const [rows] = await dbPool.query<SessionInviteRow[]>(
+    `SELECT id, session_id, invite_token, role, created_by, max_uses, used_count, status, expires_at, created_at, updated_at
+     FROM session_invites
+     WHERE invite_token = ?
+     LIMIT 1`,
+    [inviteToken]
+  );
+  return rows[0] ?? null;
+};
+
+export const consumeSessionInvite = async (inviteId: number, connection?: PoolConnection): Promise<boolean> => {
+  const executor = getExecutor(connection);
+  // 单条 UPDATE 原子消耗邀请码，避免并发多次加入超发。
+  const [result] = await executor.execute<ResultSetHeader>(
+    `UPDATE session_invites
+     SET used_count = used_count + 1,
+         status = CASE
+           WHEN max_uses IS NOT NULL AND used_count + 1 >= max_uses THEN 'disabled'
+           ELSE status
+         END,
+         updated_at = NOW()
+     WHERE id = ?
+       AND status = 'active'
+       AND (expires_at IS NULL OR expires_at > NOW())
+       AND (max_uses IS NULL OR used_count < max_uses)`,
+    [inviteId]
+  );
+  return result.affectedRows > 0;
+};
+
+export const countActiveSessionInvitesBySessionId = async (sessionId: number): Promise<number> => {
+  const [rows] = await dbPool.query<TotalRow[]>(
+    `SELECT COUNT(*) AS total
+     FROM session_invites
+     WHERE session_id = ?
+       AND status = 'active'
+       AND (expires_at IS NULL OR expires_at > NOW())
+       AND (max_uses IS NULL OR used_count < max_uses)`,
+    [sessionId]
+  );
+  return Number(rows[0]?.total ?? 0);
+};
+
+export const findSessionInvitesBySessionId = async (sessionId: number): Promise<SessionInviteRow[]> => {
+  const [rows] = await dbPool.query<SessionInviteRow[]>(
+    `SELECT id, session_id, invite_token, role, created_by, max_uses, used_count, status, expires_at, created_at, updated_at
+     FROM session_invites
+     WHERE session_id = ?
+     ORDER BY created_at DESC, id DESC`,
+    [sessionId]
+  );
+  return rows;
+};
+
+export const setSessionInviteDisabled = async (
+  sessionId: number,
+  inviteId: number,
+  connection?: PoolConnection
+): Promise<boolean> => {
+  const executor = getExecutor(connection);
+  // 仅 active 邀请可作废，重复作废返回 false。
+  const [result] = await executor.execute<ResultSetHeader>(
+    `UPDATE session_invites
+     SET status = 'disabled', updated_at = NOW()
+     WHERE id = ? AND session_id = ? AND status = 'active'`,
+    [inviteId, sessionId]
+  );
+  return result.affectedRows > 0;
 };
 
 export const setSessionMemberOnlineStatus = async (
@@ -116,6 +252,7 @@ export const setSessionMemberOnlineStatus = async (
 };
 
 export const setSessionMemberActiveStatus = async (sessionId: number, userId: number): Promise<void> => {
+  // 重新加入时清理 left/removed 时间，恢复为活跃成员。
   await dbPool.execute<ResultSetHeader>(
     `UPDATE session_members
      SET membership_status = 'active', online_status = 1, last_active_at = NOW(), left_at = NULL, removed_at = NULL
@@ -163,6 +300,7 @@ export const setSessionMemberRole = async (
   connection?: PoolConnection
 ): Promise<void> => {
   const executor = getExecutor(connection);
+  // 角色变更仅更新 role 字段，成员关系状态由其他方法维护。
   await executor.execute<ResultSetHeader>(
     `UPDATE session_members
      SET role = ?
@@ -250,24 +388,68 @@ export const findUserJoinedSessions = async (
 
   // 通过 LEFT JOIN + COUNT 计算每个会话成员数；GROUP BY 保证每个会话一行。
   const sql = hasStatusFilter
-    ? `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm_all.id) AS member_count,
-              SUM(CASE WHEN sm_all.online_status = 1 AND sm_all.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count
+    ? `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.is_paused, s.created_at, s.updated_at, COUNT(sm_all.id) AS member_count,
+              SUM(CASE WHEN sm_all.online_status = 1 AND sm_all.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count,
+              (
+                SELECT o.timestamp
+                FROM operations o
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_at,
+              (
+                SELECT o.user_id
+                FROM operations o
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_user_id,
+              (
+                SELECT u2.username
+                FROM operations o
+                LEFT JOIN users u2 ON u2.id = o.user_id
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_user_name
        FROM session_members sm
        INNER JOIN sessions s ON s.id = sm.session_id
        LEFT JOIN users u ON u.id = s.creator_id
        LEFT JOIN session_members sm_all ON sm_all.session_id = s.id AND sm_all.membership_status = 'active'
        WHERE sm.user_id = ? AND sm.membership_status = 'active' AND s.status = ?
-       GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.created_at, s.updated_at
+       GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.is_paused, s.created_at, s.updated_at
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`
-    : `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm_all.id) AS member_count,
-              SUM(CASE WHEN sm_all.online_status = 1 AND sm_all.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count
+    : `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.is_paused, s.created_at, s.updated_at, COUNT(sm_all.id) AS member_count,
+              SUM(CASE WHEN sm_all.online_status = 1 AND sm_all.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count,
+              (
+                SELECT o.timestamp
+                FROM operations o
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_at,
+              (
+                SELECT o.user_id
+                FROM operations o
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_user_id,
+              (
+                SELECT u2.username
+                FROM operations o
+                LEFT JOIN users u2 ON u2.id = o.user_id
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_user_name
        FROM session_members sm
        INNER JOIN sessions s ON s.id = sm.session_id
        LEFT JOIN users u ON u.id = s.creator_id
        LEFT JOIN session_members sm_all ON sm_all.session_id = s.id AND sm_all.membership_status = 'active'
        WHERE sm.user_id = ? AND sm.membership_status = 'active'
-       GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.created_at, s.updated_at
+       GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.is_paused, s.created_at, s.updated_at
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`;
 
@@ -290,22 +472,66 @@ export const findSessionsByCreator = async (
 
   // 创建者维度查询时，不要求当前登录用户是成员。
   const sql = hasStatusFilter
-    ? `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm.id) AS member_count,
-              SUM(CASE WHEN sm.online_status = 1 AND sm.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count
+    ? `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.is_paused, s.created_at, s.updated_at, COUNT(sm.id) AS member_count,
+              SUM(CASE WHEN sm.online_status = 1 AND sm.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count,
+              (
+                SELECT o.timestamp
+                FROM operations o
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_at,
+              (
+                SELECT o.user_id
+                FROM operations o
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_user_id,
+              (
+                SELECT u2.username
+                FROM operations o
+                LEFT JOIN users u2 ON u2.id = o.user_id
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_user_name
        FROM sessions s
        LEFT JOIN users u ON u.id = s.creator_id
        LEFT JOIN session_members sm ON sm.session_id = s.id AND sm.membership_status = 'active'
        WHERE s.creator_id = ? AND s.status = ?
-       GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.created_at, s.updated_at
+       GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.is_paused, s.created_at, s.updated_at
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`
-    : `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.created_at, s.updated_at, COUNT(sm.id) AS member_count,
-              SUM(CASE WHEN sm.online_status = 1 AND sm.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count
+    : `SELECT s.id, s.session_key, s.name, s.creator_id, u.username AS creator_name, s.status, s.current_version, s.is_paused, s.created_at, s.updated_at, COUNT(sm.id) AS member_count,
+              SUM(CASE WHEN sm.online_status = 1 AND sm.last_active_at >= DATE_SUB(NOW(), INTERVAL ? SECOND) THEN 1 ELSE 0 END) AS online_member_count,
+              (
+                SELECT o.timestamp
+                FROM operations o
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_at,
+              (
+                SELECT o.user_id
+                FROM operations o
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_user_id,
+              (
+                SELECT u2.username
+                FROM operations o
+                LEFT JOIN users u2 ON u2.id = o.user_id
+                WHERE o.session_id = s.id
+                ORDER BY o.server_version DESC, o.id DESC
+                LIMIT 1
+              ) AS last_operation_user_name
        FROM sessions s
        LEFT JOIN users u ON u.id = s.creator_id
        LEFT JOIN session_members sm ON sm.session_id = s.id AND sm.membership_status = 'active'
        WHERE s.creator_id = ?
-       GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.created_at, s.updated_at
+       GROUP BY s.id, s.session_key, s.name, s.creator_id, u.username, s.status, s.current_version, s.is_paused, s.created_at, s.updated_at
        ORDER BY s.created_at DESC
        LIMIT ? OFFSET ?`;
 
@@ -393,6 +619,7 @@ export const findSessionMemberPreviewsBySessionIds = async (
   const params = [...sessionIds, limitPerSession];
   const [rows] = await dbPool.query<SessionMemberRow[]>(sql, params);
   const threshold = Date.now() - onlineTimeoutSeconds * 1000;
+  // 在线态二次校正：超过超时阈值则降级为离线，减少脏在线状态。
   return rows.map((row) => {
     const lastActiveValue = row.last_active_at ? new Date(row.last_active_at).getTime() : 0;
     const isOnline = row.online_status === 1 && lastActiveValue >= threshold;

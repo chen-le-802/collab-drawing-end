@@ -4,6 +4,7 @@ export interface ApiResponse<T> {
   data: T | null;
 }
 
+// -------------------------- 用户与认证 --------------------------
 export interface UserVO {
   id: number;
   username: string;
@@ -35,7 +36,9 @@ export interface AuthPayload {
   userId: number;
 }
 
-export type GraphicObjectType = "line" | "rect" | "circle" | "text" | "path";
+// -------------------------- 画布图元 --------------------------
+export type GraphicObjectType = "line" | "rect" | "circle" | "text" | "path" | "image";
+export type GraphicLineStyle = "solid" | "dashed";
 
 export interface PathPoint {
   x: number;
@@ -52,11 +55,14 @@ export interface GraphicVO {
   width: number | null;
   height: number | null;
   strokeColor: string;
+  lineStyle: GraphicLineStyle;
   fillColor: string | null;
   strokeWidth: number;
   textContent: string | null;
   fontSize: number | null;
   pathPoints: PathPoint[] | null;
+  isLocked: boolean;
+  rotation: number;
   zIndex: number;
   version: number;
   creatorId: number;
@@ -72,11 +78,14 @@ export interface CreateGraphicDTO {
   width?: number;
   height?: number;
   strokeColor: string;
+  lineStyle?: GraphicLineStyle;
   fillColor?: string;
   strokeWidth: number;
   textContent?: string;
   fontSize?: number;
   pathPoints?: PathPoint[];
+  isLocked?: boolean;
+  rotation?: number;
   zIndex: number;
 }
 
@@ -86,14 +95,18 @@ export interface UpdateGraphicDTO {
   width?: number;
   height?: number;
   strokeColor?: string;
+  lineStyle?: GraphicLineStyle;
   fillColor?: string;
   strokeWidth?: number;
   textContent?: string;
   fontSize?: number;
   pathPoints?: PathPoint[];
+  isLocked?: boolean;
+  rotation?: number;
   zIndex?: number;
 }
 
+// -------------------------- 协同操作与冲突 --------------------------
 export type CollaborativeOperationType = "create_graphic" | "update_graphic" | "delete_graphic";
 
 export interface OperationVO {
@@ -143,7 +156,7 @@ export interface SessionOperationTimelineQuery {
   fromVersion?: number;
   toVersion?: number;
   userId?: number;
-  operationType?: "create" | "update" | "delete";
+  operationType?: "create" | "update" | "delete" | "restore";
   conflictType?: CollaborationConflictType;
   page: number;
   pageSize: number;
@@ -182,12 +195,15 @@ export interface SessionConflictLogsVO {
   conflicts: SessionConflictLogItemVO[];
 }
 
+// -------------------------- 快照 / 回放 / 恢复 --------------------------
 export interface SessionSnapshotItemVO {
   id: number;
   sessionId: number;
   version: number;
+  snapshotName?: string;
   graphicCount: number;
   createdBy?: number;
+  createdByName?: string;
   createdAt: string;
 }
 
@@ -221,6 +237,7 @@ export interface SessionRestoreVersionVO {
   deletedCount: number;
 }
 
+// -------------------------- 会话与成员 --------------------------
 export interface SessionVO {
   sessionId: number;
   sessionKey: string;
@@ -228,11 +245,16 @@ export interface SessionVO {
   creatorId: number;
   creatorName?: string;
   status: number;
+  isPaused?: boolean;
   memberCount?: number;
   onlineMemberCount?: number;
   memberPreviews?: SessionMemberPreviewVO[];
   currentVersion?: number;
+  lastOperationAt?: string;
+  lastOperationUserId?: number;
+  lastOperationUserName?: string;
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface SessionMemberPreviewVO {
@@ -259,10 +281,53 @@ export interface SessionDetailVO extends SessionVO {
   currentVersion: number;
 }
 
+export interface SessionPauseVO {
+  sessionId: number;
+  sessionKey: string;
+  isPaused: boolean;
+}
+
+export interface SessionCloseVO {
+  sessionId: number;
+  sessionKey: string;
+  status: number;
+}
+
 export interface SessionJoinVO {
   sessionId: number;
   sessionKey: string;
   name: string;
   currentVersion: number;
   graphics: GraphicVO[];
+}
+
+export interface SessionInviteCreateVO {
+  sessionId: number;
+  sessionKey: string;
+  inviteToken: string;
+  role: number;
+  maxUses: number | null;
+  expiresAt: string;
+  invitePath: string;
+}
+
+export type SessionInviteStatus = "active" | "used" | "expired" | "revoked";
+
+export interface SessionInviteItemVO {
+  id: number;
+  inviteToken: string;
+  role: number;
+  status: SessionInviteStatus;
+  maxUses: number | null;
+  usedCount: number;
+  createdBy: number;
+  createdAt: string;
+  expiresAt?: string;
+  invitePath?: string;
+}
+
+export interface SessionInviteListVO {
+  sessionId: number;
+  sessionKey: string;
+  list: SessionInviteItemVO[];
 }

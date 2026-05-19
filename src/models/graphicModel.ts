@@ -15,17 +15,20 @@ export type GraphicRow = RowDataPacket & {
   id: number;
   session_id: number;
   object_key: string;
-  object_type: "line" | "rect" | "circle" | "text" | "path";
+  object_type: "line" | "rect" | "circle" | "text" | "path" | "image";
   position_x: number | string;
   position_y: number | string;
   width: number | string | null;
   height: number | string | null;
   stroke_color: string;
+  line_style: "solid" | "dashed";
   fill_color: string | null;
   stroke_width: number | string;
   text_content: string | null;
   font_size: number | null;
   path_points: string | null;
+  is_locked: number;
+  rotation: number | string;
   z_index: number;
   version: number | string;
   creator_id: number;
@@ -37,17 +40,20 @@ export type GraphicRow = RowDataPacket & {
 type InsertGraphicInput = {
   sessionId: number;
   objectKey: string;
-  objectType: "line" | "rect" | "circle" | "text" | "path";
+  objectType: "line" | "rect" | "circle" | "text" | "path" | "image";
   positionX: number;
   positionY: number;
   width: number | null;
   height: number | null;
   strokeColor: string;
+  lineStyle: "solid" | "dashed";
   fillColor: string | null;
   strokeWidth: number;
   textContent: string | null;
   fontSize: number | null;
   pathPoints: string | null;
+  isLocked: boolean;
+  rotation: number;
   zIndex: number;
   version: number;
   creatorId: number;
@@ -59,11 +65,14 @@ export type GraphicUpdateDbPatch = {
   width?: number | null;
   height?: number | null;
   strokeColor?: string;
+  lineStyle?: "solid" | "dashed";
   fillColor?: string | null;
   strokeWidth?: number;
   textContent?: string | null;
   fontSize?: number | null;
   pathPoints?: string | null;
+  isLocked?: boolean;
+  rotation?: number;
   zIndex?: number;
 };
 
@@ -72,6 +81,7 @@ const getExecutor = (connection?: PoolConnection): QueryExecutor => {
 };
 
 export const findSessionCurrentVersion = async (sessionId: number): Promise<number | null> => {
+  // 读取会话当前版本，null 表示会话不存在。
   const [rows] = await dbPool.query<SessionVersionRow[]>(
     "SELECT current_version FROM sessions WHERE id = ? LIMIT 1",
     [sessionId]
@@ -108,9 +118,9 @@ export const insertGraphicObject = async (input: InsertGraphicInput, connection?
   const [result] = await executor.execute<ResultSetHeader>(
     `INSERT INTO graphic_objects (
       session_id, object_key, object_type, position_x, position_y, width, height,
-      stroke_color, fill_color, stroke_width, text_content, font_size, path_points, z_index,
+      stroke_color, line_style, fill_color, stroke_width, text_content, font_size, path_points, is_locked, rotation, z_index,
       version, creator_id, is_deleted
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
     [
       input.sessionId,
       input.objectKey,
@@ -120,11 +130,14 @@ export const insertGraphicObject = async (input: InsertGraphicInput, connection?
       input.width,
       input.height,
       input.strokeColor,
+      input.lineStyle,
       input.fillColor,
       input.strokeWidth,
       input.textContent,
       input.fontSize,
       input.pathPoints,
+      input.isLocked ? 1 : 0,
+      input.rotation,
       input.zIndex,
       input.version,
       input.creatorId
@@ -137,7 +150,7 @@ export const findGraphicById = async (graphicId: number, connection?: PoolConnec
   const executor = getExecutor(connection);
   const [rows] = await executor.query<GraphicRow[]>(
     `SELECT id, session_id, object_key, object_type, position_x, position_y, width, height,
-            stroke_color, fill_color, stroke_width, text_content, font_size, path_points, z_index,
+            stroke_color, line_style, fill_color, stroke_width, text_content, font_size, path_points, is_locked, rotation, z_index,
             version, creator_id, is_deleted, created_at, updated_at
      FROM graphic_objects
      WHERE id = ?
@@ -157,7 +170,7 @@ export const findGraphicByObjectKey = async (
   // includeDeleted=true 用于 update/delete 场景识别“已软删除”对象。
   const [rows] = await executor.query<GraphicRow[]>(
     `SELECT id, session_id, object_key, object_type, position_x, position_y, width, height,
-            stroke_color, fill_color, stroke_width, text_content, font_size, path_points, z_index,
+            stroke_color, line_style, fill_color, stroke_width, text_content, font_size, path_points, is_locked, rotation, z_index,
             version, creator_id, is_deleted, created_at, updated_at
      FROM graphic_objects
      WHERE session_id = ? AND object_key = ? ${includeDeleted ? "" : "AND is_deleted = 0"}
@@ -198,6 +211,10 @@ export const updateGraphicObjectById = async (
     fields.push("stroke_color = ?");
     params.push(patch.strokeColor);
   }
+  if (typeof patch.lineStyle === "string") {
+    fields.push("line_style = ?");
+    params.push(patch.lineStyle);
+  }
   if (typeof patch.fillColor === "string" || patch.fillColor === null) {
     fields.push("fill_color = ?");
     params.push(patch.fillColor);
@@ -217,6 +234,14 @@ export const updateGraphicObjectById = async (
   if (typeof patch.pathPoints === "string" || patch.pathPoints === null) {
     fields.push("path_points = ?");
     params.push(patch.pathPoints);
+  }
+  if (typeof patch.isLocked === "boolean") {
+    fields.push("is_locked = ?");
+    params.push(patch.isLocked ? 1 : 0);
+  }
+  if (typeof patch.rotation === "number") {
+    fields.push("rotation = ?");
+    params.push(patch.rotation);
   }
   if (typeof patch.zIndex === "number") {
     fields.push("z_index = ?");
@@ -248,13 +273,13 @@ export const findActiveGraphicsBySessionId = async (sessionId: number, sinceVers
   // 增量拉取走 version 排序，全量拉取走 z_index 排序，满足画布渲染顺序。
   const sql = hasSince
     ? `SELECT id, session_id, object_key, object_type, position_x, position_y, width, height,
-              stroke_color, fill_color, stroke_width, text_content, font_size, path_points, z_index,
+              stroke_color, line_style, fill_color, stroke_width, text_content, font_size, path_points, is_locked, rotation, z_index,
               version, creator_id, is_deleted, created_at, updated_at
        FROM graphic_objects
        WHERE session_id = ? AND is_deleted = 0 AND version > ?
        ORDER BY version ASC, id ASC`
     : `SELECT id, session_id, object_key, object_type, position_x, position_y, width, height,
-              stroke_color, fill_color, stroke_width, text_content, font_size, path_points, z_index,
+              stroke_color, line_style, fill_color, stroke_width, text_content, font_size, path_points, is_locked, rotation, z_index,
               version, creator_id, is_deleted, created_at, updated_at
        FROM graphic_objects
        WHERE session_id = ? AND is_deleted = 0

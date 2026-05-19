@@ -7,6 +7,7 @@ type QueryExecutor = {
   execute: PoolConnection["execute"];
 };
 
+// 支持在事务连接和默认连接之间复用同一套 model 方法。
 const getExecutor = (connection?: PoolConnection): QueryExecutor => {
   return connection ?? dbPool;
 };
@@ -39,11 +40,13 @@ export type OperationTimelineQuery = {
   userId?: number;
   operationType?: DbOperationType;
   conflictType?: ConflictType;
+  restoreFilter?: "exclude" | "only" | "all";
   offset: number;
   limit: number;
 };
 
 const buildTimelineWhere = (query: OperationTimelineQuery): { where: string; params: Array<number | string> } => {
+  // 动态拼接时间线筛选条件，保证 count/list 使用同一 where 逻辑。
   const clauses: string[] = ["session_id = ?"];
   const params: Array<number | string> = [query.sessionId];
 
@@ -67,6 +70,14 @@ const buildTimelineWhere = (query: OperationTimelineQuery): { where: string; par
     clauses.push("conflict_type = ?");
     params.push(query.conflictType);
   }
+  if (query.restoreFilter === "exclude") {
+    clauses.push("(client_id IS NULL OR client_id NOT LIKE 'restore_%')");
+    clauses.push("(operation_id IS NULL OR operation_id NOT LIKE 'rs_%')");
+  }
+  if (query.restoreFilter === "only") {
+    // 兼容历史数据：优先识别 client_id=restore_*，并兜底识别 operation_id=rs_*。
+    clauses.push("(client_id LIKE 'restore_%' OR operation_id LIKE 'rs_%')");
+  }
 
   return {
     where: clauses.join(" AND "),
@@ -80,6 +91,7 @@ export const findOperationsBySessionSinceVersion = async (
   limit = 500
 ): Promise<OperationRow[]> => {
   const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : 500;
+  // 增量同步按 server_version 升序返回，前端可直接顺序回放。
   const [rows] = await dbPool.query<OperationRow[]>(
     `SELECT id, version, operation_id, session_id, user_id, object_key, operation_type, operation_data,
             base_version, server_version, lamport_time, client_id, resolved_result, conflict_type, timestamp
@@ -99,6 +111,7 @@ export const findOperationsBySessionVersionRange = async (
   limit = 5000
 ): Promise<OperationRow[]> => {
   const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 10000) : 5000;
+  // 版本回放场景允许更大 limit，但仍设置硬上限防止单次拉取过大。
   const [rows] = await dbPool.query<OperationRow[]>(
     `SELECT id, version, operation_id, session_id, user_id, object_key, operation_type, operation_data,
             base_version, server_version, lamport_time, client_id, resolved_result, conflict_type, timestamp
@@ -124,6 +137,7 @@ export const countOperationsByTimelineQuery = async (query: OperationTimelineQue
 
 export const findOperationsByTimelineQuery = async (query: OperationTimelineQuery): Promise<OperationRow[]> => {
   const { where, params } = buildTimelineWhere(query);
+  // 时间线列表按最新版本倒序展示，符合“最近操作优先看”的产品习惯。
   const [rows] = await dbPool.query<OperationRow[]>(
     `SELECT id, version, operation_id, session_id, user_id, object_key, operation_type, operation_data,
             base_version, server_version, lamport_time, client_id, resolved_result, conflict_type, timestamp
@@ -173,6 +187,7 @@ export const insertOperationRecord = async (
   connection?: PoolConnection
 ): Promise<number> => {
   const executor = getExecutor(connection);
+  // version 与 server_version 同步写入，兼容历史查询逻辑。
   const [result] = await executor.execute<ResultSetHeader>(
     `INSERT INTO operations (
       operation_id, session_id, user_id, object_key, operation_type, operation_data,
@@ -214,6 +229,7 @@ export const upsertGraphicFieldVersion = async (
   connection?: PoolConnection
 ): Promise<void> => {
   const executor = getExecutor(connection);
+  // 字段版本采用 UPSERT：首次写入新增，后续冲突判定后覆盖更新。
   await executor.execute(
     `INSERT INTO graphic_field_versions (
       session_id, object_key, field_name, lamport_time, server_version, client_id, updated_by
@@ -233,6 +249,42 @@ export const upsertGraphicFieldVersion = async (
       input.clientId,
       input.updatedBy
     ]
+  );
+};
+
+export const upsertGraphicFieldVersionsBatch = async (
+  inputs: UpsertFieldVersionInput[],
+  connection?: PoolConnection
+): Promise<void> => {
+  if (!Array.isArray(inputs) || inputs.length === 0) {
+    return;
+  }
+  const executor = getExecutor(connection);
+  const placeholders = inputs.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(", ");
+  const params: Array<number | string> = [];
+  inputs.forEach((item) => {
+    params.push(
+      item.sessionId,
+      item.objectKey,
+      item.fieldName,
+      item.lamportTime,
+      item.serverVersion,
+      item.clientId,
+      item.updatedBy
+    );
+  });
+
+  await executor.execute(
+    `INSERT INTO graphic_field_versions (
+      session_id, object_key, field_name, lamport_time, server_version, client_id, updated_by
+    ) VALUES ${placeholders}
+    ON DUPLICATE KEY UPDATE
+      lamport_time = VALUES(lamport_time),
+      server_version = VALUES(server_version),
+      client_id = VALUES(client_id),
+      updated_by = VALUES(updated_by),
+      updated_at = NOW()`,
+    params
   );
 };
 
@@ -291,6 +343,7 @@ export const insertConflictLog = async (
   connection?: PoolConnection
 ): Promise<void> => {
   const executor = getExecutor(connection);
+  // 冲突值统一按 JSON 字符串持久化，便于后续 UI 还原差异详情。
   await executor.execute(
     `INSERT INTO conflict_logs (
       operation_ref_id, operation_id, session_id, object_key, conflict_type, field_name,
@@ -311,12 +364,47 @@ export const insertConflictLog = async (
   );
 };
 
+export const insertConflictLogsBatch = async (
+  inputs: InsertConflictLogInput[],
+  connection?: PoolConnection
+): Promise<void> => {
+  if (!Array.isArray(inputs) || inputs.length === 0) {
+    return;
+  }
+  const executor = getExecutor(connection);
+  const placeholders = inputs.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+  const params: Array<number | string | null> = [];
+  inputs.forEach((input) => {
+    params.push(
+      input.operationRefId ?? null,
+      input.operationId,
+      input.sessionId,
+      input.objectKey,
+      input.conflictType,
+      input.fieldName ?? null,
+      typeof input.currentValue === "undefined" ? null : JSON.stringify(input.currentValue),
+      typeof input.incomingValue === "undefined" ? null : JSON.stringify(input.incomingValue),
+      typeof input.resolvedValue === "undefined" ? null : JSON.stringify(input.resolvedValue),
+      input.resolveStrategy
+    );
+  });
+
+  await executor.execute(
+    `INSERT INTO conflict_logs (
+      operation_ref_id, operation_id, session_id, object_key, conflict_type, field_name,
+      current_value, incoming_value, resolved_value, resolve_strategy
+    ) VALUES ${placeholders}`,
+    params
+  );
+};
+
 export const findConflictLogsBySession = async (
   sessionId: number,
   sinceId: number,
   limit = 100
 ): Promise<ConflictLogRow[]> => {
   const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 100;
+  // 冲突日志按自增 id 正序增量拉取，适配“从上次位置继续读”。
   const [rows] = await dbPool.query<ConflictLogRow[]>(
     `SELECT id, operation_ref_id, operation_id, session_id, object_key, conflict_type, field_name,
             current_value, incoming_value, resolved_value, resolve_strategy, created_at

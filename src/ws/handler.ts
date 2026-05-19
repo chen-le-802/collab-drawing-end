@@ -13,12 +13,16 @@ import {
 import { findUserById } from "../models/userModel";
 import { graphicService, GraphicServiceError } from "../services/graphicService";
 import { OperationServiceError, operationService } from "../services/operationService";
+import { markOffline, markOnlineHeartbeat } from "../services/presenceService";
 import { getSessionDetailForUser, SessionServiceError } from "../services/sessionService";
 import { undoService, UndoServiceError } from "../services/undoService";
+import { emitAlert } from "../services/alertService";
 import { MemberVO } from "../types";
+import { publishWsBroadcast } from "./pubsub";
 import {
   AuthedWebSocket,
   BaseClientMessage,
+  CursorMoveData,
   CreateGraphicData,
   DeleteGraphicData,
   ErrorPayload,
@@ -26,6 +30,7 @@ import {
   JoinSessionPayload,
   LeaveSessionData,
   OperationResolvedPayload,
+  SelectionChangeData,
   ServerMessage,
   ServerMessageType,
   UndoRedoData,
@@ -71,6 +76,17 @@ const safeSend = <T>(ws: AuthedWebSocket, type: ServerMessageType, data: T): voi
 const sendError = (ws: AuthedWebSocket, originalType: string, code: WsErrorCode, message: string): void => {
   const payload: ErrorPayload = { code, message, originalType };
   safeSend(ws, "error", payload);
+  if (code === 4001) {
+    emitAlert({
+      key: "ws.error.4001",
+      level: "error",
+      message: "WebSocket 业务处理返回 4001",
+      detail: {
+        originalType,
+        userId: ws.clientData?.userId ?? null
+      }
+    });
+  }
 };
 
 const parseMessage = (raw: WebSocket.RawData): BaseClientMessage | null => {
@@ -94,6 +110,7 @@ const parseMessage = (raw: WebSocket.RawData): BaseClientMessage | null => {
   }
 
   try {
+    // 消息最小结构校验：type + timestamp，避免脏数据进入业务处理。
     const parsed = JSON.parse(normalized) as BaseClientMessage;
     if (!parsed || typeof parsed.type !== "string" || typeof parsed.timestamp !== "number") {
       return null;
@@ -109,7 +126,8 @@ const broadcastRoom = <T>(
   sessionKey: string,
   messageType: ServerMessageType,
   data: T,
-  exclude?: AuthedWebSocket
+  exclude?: AuthedWebSocket,
+  options?: { fromRedis?: boolean }
 ): void => {
   const room = context.rooms.get(sessionKey);
   if (!room || room.size === 0) {
@@ -122,6 +140,13 @@ const broadcastRoom = <T>(
     }
     safeSend(client, messageType, data);
   });
+
+  if (!options?.fromRedis) {
+    // 本地广播成功后再投递 Redis，其他节点房间可同步收到。
+    void publishWsBroadcast(sessionKey, messageType, data).catch(() => {
+      // ignore redis broadcast error; local broadcast has already been sent
+    });
+  }
 };
 
 const normalizeOriginalType = (value: unknown): string => {
@@ -189,6 +214,16 @@ const assertSessionMemberAccess = async (sessionKey: string, userId: number): Pr
   return { sessionId: session.id };
 };
 
+const resolveSessionAccess = async (ws: AuthedWebSocket, sessionKey: string): Promise<{ sessionId: number }> => {
+  const cachedSessionId = ws.clientData.sessionIdCache.get(sessionKey);
+  if (typeof cachedSessionId === "number" && cachedSessionId > 0) {
+    return { sessionId: cachedSessionId };
+  }
+  const access = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
+  ws.clientData.sessionIdCache.set(sessionKey, access.sessionId);
+  return access;
+};
+
 
 const mapBusinessError = (error: unknown): { code: WsErrorCode; message: string } => {
   if (error instanceof SessionServiceError) {
@@ -254,6 +289,10 @@ const onJoinSession = async (context: WsContext, ws: AuthedWebSocket, payload: J
 
   const access = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
   await setSessionMemberOnlineStatus(access.sessionId, ws.clientData.userId, 1);
+  ws.clientData.sessionIdCache.set(sessionKey, access.sessionId);
+  await markOnlineHeartbeat(sessionKey, ws.clientData.userId, { force: true }).catch(() => {
+    // ignore redis heartbeat failure
+  });
   const detail = await getSessionDetailForUser(sessionKey, ws.clientData.userId);
   const graphicSnapshot = await graphicService.getGraphics(access.sessionId);
   joinRoom(context, sessionKey, ws);
@@ -301,6 +340,10 @@ const onLeaveSession = async (context: WsContext, ws: AuthedWebSocket, payload: 
   }
 
   await setSessionMemberLeftStatus(session.id, ws.clientData.userId);
+  await markOffline(sessionKey, ws.clientData.userId).catch(() => {
+    // ignore redis heartbeat failure
+  });
+  ws.clientData.sessionIdCache.delete(sessionKey);
   leaveRoom(context, sessionKey, ws);
   safeSend(ws, "session_left", { sessionKey });
 
@@ -318,7 +361,10 @@ const onCreateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
     return;
   }
 
-  const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
+  const { sessionId } = await resolveSessionAccess(ws, sessionKey);
+  await markOnlineHeartbeat(sessionKey, ws.clientData.userId, { force: true }).catch(() => {
+    // ignore redis heartbeat failure
+  });
   const result = await operationService.createGraphic(
     sessionId,
     ws.clientData.userId,
@@ -330,12 +376,15 @@ const onCreateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
       width: payload.width,
       height: payload.height,
       strokeColor: payload.strokeColor,
+      lineStyle: payload.lineStyle,
       fillColor: payload.fillColor,
       strokeWidth: payload.strokeWidth,
       zIndex: payload.zIndex,
       textContent: payload.textContent,
       fontSize: payload.fontSize,
-      pathPoints: payload.pathPoints
+      pathPoints: payload.pathPoints,
+      isLocked: payload.isLocked,
+      rotation: payload.rotation
     },
     {
       operationId: payload.operationId,
@@ -370,7 +419,10 @@ const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
   }
 
   const patchPayload = payload.patch ?? {};
-  const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
+  const { sessionId } = await resolveSessionAccess(ws, sessionKey);
+  await markOnlineHeartbeat(sessionKey, ws.clientData.userId, { force: true }).catch(() => {
+    // ignore redis heartbeat failure
+  });
   const result = await operationService.updateGraphic(
     sessionId,
     ws.clientData.userId,
@@ -381,12 +433,17 @@ const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
       width: typeof patchPayload.width === "number" ? patchPayload.width : payload.width,
       height: typeof patchPayload.height === "number" ? patchPayload.height : payload.height,
       strokeColor: typeof patchPayload.strokeColor === "string" ? patchPayload.strokeColor : payload.strokeColor,
+      lineStyle: patchPayload.lineStyle === "dashed" || patchPayload.lineStyle === "solid"
+        ? patchPayload.lineStyle
+        : payload.lineStyle,
       fillColor: typeof patchPayload.fillColor === "string" ? patchPayload.fillColor : payload.fillColor,
       strokeWidth: typeof patchPayload.strokeWidth === "number" ? patchPayload.strokeWidth : payload.strokeWidth,
       zIndex: typeof patchPayload.zIndex === "number" ? patchPayload.zIndex : payload.zIndex,
       textContent: typeof patchPayload.textContent === "string" ? patchPayload.textContent : payload.textContent,
       fontSize: typeof patchPayload.fontSize === "number" ? patchPayload.fontSize : payload.fontSize,
-      pathPoints: Array.isArray(patchPayload.pathPoints) ? patchPayload.pathPoints : payload.pathPoints
+      pathPoints: Array.isArray(patchPayload.pathPoints) ? patchPayload.pathPoints : payload.pathPoints,
+      isLocked: typeof patchPayload.isLocked === "boolean" ? patchPayload.isLocked : payload.isLocked,
+      rotation: typeof patchPayload.rotation === "number" ? patchPayload.rotation : payload.rotation
     },
     {
       operationId: payload.operationId,
@@ -420,7 +477,10 @@ const onDeleteGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
     return;
   }
 
-  const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
+  const { sessionId } = await resolveSessionAccess(ws, sessionKey);
+  await markOnlineHeartbeat(sessionKey, ws.clientData.userId, { force: true }).catch(() => {
+    // ignore redis heartbeat failure
+  });
   const result = await operationService.deleteGraphic(
     sessionId,
     ws.clientData.userId,
@@ -470,6 +530,21 @@ const resolveUndoRedoState = async (
   };
 };
 
+const resolveBatchTimes = (value: unknown): number => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 1;
+  }
+  const normalized = Math.floor(parsed);
+  if (normalized < 1) {
+    return 1;
+  }
+  if (normalized > 50) {
+    return 50;
+  }
+  return normalized;
+};
+
 
 const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedoData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
@@ -477,14 +552,44 @@ const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     sendError(ws, "undo", 1001, "参数错误");
     return;
   }
-  const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
-  const result = await undoService.undo(sessionId, ws.clientData.userId, {
-    operationId: payload.operationId,
-    clientId: payload.clientId,
-    baseVersion: payload.baseVersion,
-    lamportTime: payload.lamportTime
+  const { sessionId } = await resolveSessionAccess(ws, sessionKey);
+  await markOnlineHeartbeat(sessionKey, ws.clientData.userId, { force: true }).catch(() => {
+    // ignore redis heartbeat failure
   });
-  if (!result.success) {
+  const times = resolveBatchTimes(payload?.times);
+  let result: Awaited<ReturnType<typeof undoService.undo>> | null = null;
+  const operations: OperationResolvedPayload[] = [];
+  const operationItems: Array<NonNullable<Awaited<ReturnType<typeof undoService.undo>>["operation"]>> = [];
+  const resolvedOperationIds: string[] = [];
+  let appliedCount = 0;
+  for (let i = 0; i < times; i += 1) {
+    try {
+      const nextResult = await undoService.undo(sessionId, ws.clientData.userId, {
+        operationId: payload.operationId ? `${payload.operationId}_${i + 1}` : undefined,
+        clientId: payload.clientId,
+        baseVersion: payload.baseVersion,
+        lamportTime: typeof payload.lamportTime === "number" ? payload.lamportTime + i : undefined
+      });
+      if (!nextResult.success) {
+        break;
+      }
+      result = nextResult;
+      if (nextResult.operation) {
+        operationItems.push(nextResult.operation);
+      }
+      if (typeof nextResult.resolvedOperationId === "string" && nextResult.resolvedOperationId.length > 0) {
+        resolvedOperationIds.push(nextResult.resolvedOperationId);
+      }
+      appliedCount += 1;
+    } catch (error) {
+      // 批量撤销中途遇到“已无可撤销项”时，保留已成功部分并正常返回。
+      if (error instanceof UndoServiceError && error.code === "NO_UNDOABLE_OPERATION" && appliedCount > 0) {
+        break;
+      }
+      throw error;
+    }
+  }
+  if (!result || appliedCount === 0 || !result.success) {
     sendError(ws, "undo", 4001, "撤销失败");
     return;
   }
@@ -497,27 +602,34 @@ const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     connection.release();
   }
 
-  if (result.operation) {
-    if (result.operation.operationType === "create_graphic") {
-      broadcastRoom(context, sessionKey, "graphic_created", result.operation.data, ws);
-    } else if (result.operation.operationType === "update_graphic") {
-      broadcastRoom(context, sessionKey, "graphic_updated", result.operation.data, ws);
+  operationItems.forEach((operationItem) => {
+    // undo 后按操作类型广播画布变更，其他成员实时同步。
+    if (operationItem.operationType === "create_graphic") {
+      broadcastRoom(context, sessionKey, "graphic_created", operationItem.data, ws);
+    } else if (operationItem.operationType === "update_graphic") {
+      broadcastRoom(context, sessionKey, "graphic_updated", operationItem.data, ws);
     } else {
-      broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: result.operation.objectKey }, ws);
+      broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: operationItem.objectKey }, ws);
     }
-  }
+  });
 
-  if (typeof result.resolvedOperationId === "string" && result.resolvedOperationId.length > 0 && result.operation) {
+  for (let i = 0; i < operationItems.length; i += 1) {
+    const operationItem = operationItems[i];
+    const resolvedOperationId = resolvedOperationIds[i];
+    if (!operationItem || !resolvedOperationId) {
+      continue;
+    }
     const resolvedPayload: OperationResolvedPayload = {
-      operationId: result.resolvedOperationId,
-      objectKey: result.operation.objectKey,
-      operationType: result.operation.operationType,
+      operationId: resolvedOperationId,
+      objectKey: operationItem.objectKey,
+      operationType: operationItem.operationType,
       serverVersion: result.currentVersion,
       conflictType: "none",
       appliedFields: [],
       rejectedFields: [],
       resolveReason: "undo_applied"
     };
+    operations.push(resolvedPayload);
     safeSend(ws, "operation_resolved", resolvedPayload);
   }
 
@@ -525,11 +637,13 @@ const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     success: true,
     sessionKey,
     operation: result.operation,
+    operations: operationItems,
     currentVersion: result.currentVersion,
     operationId: result.operation?.operationId ?? 0,
     undoOperationId: result.operation?.operationId ?? 0,
     canUndo: state.canUndo,
-    canRedo: state.canRedo
+    canRedo: state.canRedo,
+    appliedCount
   });
 };
 
@@ -539,14 +653,43 @@ const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     sendError(ws, "redo", 1001, "参数错误");
     return;
   }
-  const { sessionId } = await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
-  const result = await undoService.redo(sessionId, ws.clientData.userId, {
-    operationId: payload.operationId,
-    clientId: payload.clientId,
-    baseVersion: payload.baseVersion,
-    lamportTime: payload.lamportTime
+  const { sessionId } = await resolveSessionAccess(ws, sessionKey);
+  await markOnlineHeartbeat(sessionKey, ws.clientData.userId, { force: true }).catch(() => {
+    // ignore redis heartbeat failure
   });
-  if (!result.success) {
+  const times = resolveBatchTimes(payload?.times);
+  let result: Awaited<ReturnType<typeof undoService.redo>> | null = null;
+  const operationItems: Array<NonNullable<Awaited<ReturnType<typeof undoService.redo>>["operation"]>> = [];
+  const resolvedOperationIds: string[] = [];
+  let appliedCount = 0;
+  for (let i = 0; i < times; i += 1) {
+    try {
+      const nextResult = await undoService.redo(sessionId, ws.clientData.userId, {
+        operationId: payload.operationId ? `${payload.operationId}_${i + 1}` : undefined,
+        clientId: payload.clientId,
+        baseVersion: payload.baseVersion,
+        lamportTime: typeof payload.lamportTime === "number" ? payload.lamportTime + i : undefined
+      });
+      if (!nextResult.success) {
+        break;
+      }
+      result = nextResult;
+      if (nextResult.operation) {
+        operationItems.push(nextResult.operation);
+      }
+      if (typeof nextResult.resolvedOperationId === "string" && nextResult.resolvedOperationId.length > 0) {
+        resolvedOperationIds.push(nextResult.resolvedOperationId);
+      }
+      appliedCount += 1;
+    } catch (error) {
+      // 批量重做同理：遇到无可重做项时停止，返回已应用数量。
+      if (error instanceof UndoServiceError && error.code === "NO_REDOABLE_OPERATION" && appliedCount > 0) {
+        break;
+      }
+      throw error;
+    }
+  }
+  if (!result || appliedCount === 0 || !result.success) {
     sendError(ws, "redo", 4001, "重做失败");
     return;
   }
@@ -559,21 +702,27 @@ const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     connection.release();
   }
 
-  if (result.operation) {
-    if (result.operation.operationType === "create_graphic") {
-      broadcastRoom(context, sessionKey, "graphic_created", result.operation.data, ws);
-    } else if (result.operation.operationType === "update_graphic") {
-      broadcastRoom(context, sessionKey, "graphic_updated", result.operation.data, ws);
+  operationItems.forEach((operationItem) => {
+    // redo 后按操作类型广播，保持各端画布状态一致。
+    if (operationItem.operationType === "create_graphic") {
+      broadcastRoom(context, sessionKey, "graphic_created", operationItem.data, ws);
+    } else if (operationItem.operationType === "update_graphic") {
+      broadcastRoom(context, sessionKey, "graphic_updated", operationItem.data, ws);
     } else {
-      broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: result.operation.objectKey }, ws);
+      broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: operationItem.objectKey }, ws);
     }
-  }
+  });
 
-  if (typeof result.resolvedOperationId === "string" && result.resolvedOperationId.length > 0 && result.operation) {
+  for (let i = 0; i < operationItems.length; i += 1) {
+    const operationItem = operationItems[i];
+    const resolvedOperationId = resolvedOperationIds[i];
+    if (!operationItem || !resolvedOperationId) {
+      continue;
+    }
     const resolvedPayload: OperationResolvedPayload = {
-      operationId: result.resolvedOperationId,
-      objectKey: result.operation.objectKey,
-      operationType: result.operation.operationType,
+      operationId: resolvedOperationId,
+      objectKey: operationItem.objectKey,
+      operationType: operationItem.operationType,
       serverVersion: result.currentVersion,
       conflictType: "none",
       appliedFields: [],
@@ -587,17 +736,103 @@ const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     success: true,
     sessionKey,
     operation: result.operation,
+    operations: operationItems,
     currentVersion: result.currentVersion,
     operationId: result.operation?.operationId ?? 0,
     redoOperationId: result.operation?.operationId ?? 0,
     canUndo: state.canUndo,
-    canRedo: state.canRedo
+    canRedo: state.canRedo,
+    appliedCount
   });
 };
 
 const onPing = (ws: AuthedWebSocket): void => {
   safeSend(ws, "pong", {});
 };
+
+const onCursorMove = async (context: WsContext, ws: AuthedWebSocket, payload: CursorMoveData): Promise<void> => {
+  const sessionKey = requireSessionKey(payload?.sessionKey);
+  if (!sessionKey || typeof payload.x !== "number" || typeof payload.y !== "number") {
+    sendError(ws, "cursor_move", 1001, "参数错误");
+    return;
+  }
+
+  await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
+  await markOnlineHeartbeat(sessionKey, ws.clientData.userId).catch(() => {
+    // ignore redis heartbeat failure
+  });
+  broadcastRoom(
+    context,
+    sessionKey,
+    "presence_cursor",
+    {
+      sessionKey,
+      userId: ws.clientData.userId,
+      username: ws.clientData.username,
+      x: payload.x,
+      y: payload.y
+    },
+    ws
+  );
+};
+
+const onSelectionChange = async (context: WsContext, ws: AuthedWebSocket, payload: SelectionChangeData): Promise<void> => {
+  const sessionKey = requireSessionKey(payload?.sessionKey);
+  if (!sessionKey) {
+    sendError(ws, "selection_change", 1001, "参数错误");
+    return;
+  }
+  if (typeof payload.objectKey !== "undefined" && payload.objectKey !== null && typeof payload.objectKey !== "string") {
+    sendError(ws, "selection_change", 1001, "参数错误");
+    return;
+  }
+  if (
+    typeof payload.objectKeys !== "undefined" &&
+    (!Array.isArray(payload.objectKeys) || payload.objectKeys.some((item) => typeof item !== "string"))
+  ) {
+    sendError(ws, "selection_change", 1001, "参数错误");
+    return;
+  }
+
+  await assertSessionMemberAccess(sessionKey, ws.clientData.userId);
+  await markOnlineHeartbeat(sessionKey, ws.clientData.userId).catch(() => {
+    // ignore redis heartbeat failure
+  });
+  const normalizedKeys = Array.isArray(payload.objectKeys)
+    ? Array.from(new Set(payload.objectKeys.map((item) => item.trim()).filter((item) => item.length > 0)))
+    : [];
+  const normalizedObjectKey =
+    (typeof payload.objectKey === "string" && payload.objectKey.length > 0 ? payload.objectKey : null) ??
+    (normalizedKeys[0] ?? null);
+  broadcastRoom(
+    context,
+    sessionKey,
+    "presence_selection",
+    {
+      sessionKey,
+      userId: ws.clientData.userId,
+      username: ws.clientData.username,
+      objectKey: normalizedObjectKey,
+      objectKeys: normalizedKeys
+    },
+    ws
+  );
+};
+
+const broadcastSessionPaused = async (context: WsContext, sessionKey: string, userId: number): Promise<void> => {
+  const session = await findSessionBySessionKey(sessionKey);
+  if (!session) {
+    return;
+  }
+  const user = await findUserById(userId);
+  broadcastRoom(context, sessionKey, "session_paused", {
+    sessionKey,
+    isPaused: session.is_paused === 1,
+    operatorUserId: userId,
+    operatorUsername: user?.username ?? ""
+  });
+};
+
 
 export const createWsHandler = (context: WsContext) => {
   return {
@@ -615,6 +850,7 @@ export const createWsHandler = (context: WsContext) => {
 
       const originalType = normalizeOriginalType(message.type);
       try {
+        // 统一消息分发入口：每种 type 对应一个明确 handler。
         switch (message.type) {
           case "join_session":
             await onJoinSession(context, ws, message.data as JoinSessionData);
@@ -636,6 +872,12 @@ export const createWsHandler = (context: WsContext) => {
             return;
           case "redo":
             await onRedo(context, ws, message.data as UndoRedoData);
+            return;
+          case "cursor_move":
+            await onCursorMove(context, ws, message.data as CursorMoveData);
+            return;
+          case "selection_change":
+            await onSelectionChange(context, ws, message.data as SelectionChangeData);
             return;
           case "ping":
             onPing(ws);
@@ -674,12 +916,16 @@ export const createWsHandler = (context: WsContext) => {
           const sameUserConnectionAlive = Array.from(context.userConnections.get(userId) ?? []).some((item) => {
             return item.clientData.joinedSessionKeys.has(sessionKey) && item.readyState === WebSocket.OPEN;
           });
+          // 同用户仍有其他连接在线时，不立刻广播离线，避免多标签页误闪断。
           if (sameUserConnectionAlive) {
             leaveRoom(context, sessionKey, ws);
             continue;
           }
 
           await setSessionMemberOnlineStatus(session.id, userId, 0);
+          await markOffline(sessionKey, userId).catch(() => {
+            // ignore redis heartbeat failure
+          });
           broadcastRoom(context, sessionKey, "member_left", {
             sessionKey,
             userId,
@@ -692,6 +938,7 @@ export const createWsHandler = (context: WsContext) => {
 
       Array.from(ws.clientData.joinedSessionKeys).forEach((sessionKey) => {
         leaveRoom(context, sessionKey, ws);
+        ws.clientData.sessionIdCache.delete(sessionKey);
       });
     },
 
@@ -743,6 +990,21 @@ export const createWsHandler = (context: WsContext) => {
           joinedAt: member.joined_at instanceof Date ? member.joined_at.toISOString() : new Date(member.joined_at).toISOString()
         };
       });
+    },
+
+    broadcastSessionPaused: async (sessionKey: string, userId: number): Promise<void> => {
+      await broadcastSessionPaused(context, sessionKey, userId);
+    },
+
+    handleRedisBroadcast: (payload: { sessionKey: string; messageType: ServerMessageType; data: unknown }): void => {
+      broadcastRoom(
+        context,
+        payload.sessionKey,
+        payload.messageType,
+        payload.data,
+        undefined,
+        { fromRedis: true }
+      );
     }
   };
 };

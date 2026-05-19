@@ -8,8 +8,17 @@
     "dev": "nodemon --watch src --ext ts --exec ts-node src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
+    "migrate": "ts-node src/scripts/migrate.ts up",
+    "migrate:status": "ts-node src/scripts/migrate.ts status",
+    "migrate:baseline": "ts-node src/scripts/migrate.ts baseline",
+    "preflight": "ts-node src/scripts/preflight.ts basic",
+    "preflight:full": "ts-node src/scripts/preflight.ts full",
+    "demo:conflict": "ts-node src/scripts/conflict-demo.ts",
+    "backup:once": "ts-node src/scripts/backup.ts once",
+    "backup:daemon": "ts-node src/scripts/backup.ts daemon",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:ci": "vitest run --reporter=dot --bail=1"
   },
   "keywords": [],
   "author": "",
@@ -23,9 +32,11 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.1.1",
     "mysql2": "^3.15.2",
+    "redis": "^4.7.0",
     "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@rolldown/binding-win32-x64-msvc": "1.0.0-rc.17",
     "@types/bcryptjs": "^3.0.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",

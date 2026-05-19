@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { ApiResponse, UpdateProfileDTO } from "../types";
+import { emitAlert } from "../services/alertService";
 import {
   changePassword,
   getCurrentUser,
@@ -71,6 +72,14 @@ const mapServiceError = (res: Response, error: unknown): void => {
   }
 
   send(res, { code: 4001, message: "服务器错误", data: null });
+  emitAlert({
+    key: "api.error.4001.user",
+    level: "error",
+    message: "UserController 返回 4001",
+    detail: {
+      error: error instanceof Error ? error.message : String(error)
+    }
+  });
 };
 
 export const register = async (req: Request, res: Response): Promise<void> => {
@@ -300,5 +309,13 @@ export const postChangePassword = async (req: Request, res: Response): Promise<v
       }
     }
     send(res, { code: 4001, message: "服务器错误", data: null });
+    emitAlert({
+      key: "api.error.4001.user.change_password",
+      level: "error",
+      message: "UserController.postChangePassword 返回 4001",
+      detail: {
+        error: error instanceof Error ? error.message : String(error)
+      }
+    });
   }
 };

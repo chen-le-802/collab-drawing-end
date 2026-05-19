@@ -1,5 +1,7 @@
 import { PoolConnection, RowDataPacket } from "mysql2/promise";
 
+import { env } from "../config/env";
+import { getRedisClient, isRedisReady } from "../config/redis";
 import { dbPool } from "../config/db";
 import {
   findGraphicById,
@@ -18,10 +20,10 @@ import {
   findOperationsBySessionVersionRange,
   findOperationsBySessionSinceVersion,
   findOperationsByTimelineQuery,
-  insertConflictLog,
+  insertConflictLogsBatch,
   insertOperationRecord,
   OperationRow,
-  upsertGraphicFieldVersion
+  upsertGraphicFieldVersionsBatch
 } from "../models/operationModel";
 import { findSessionBySessionKey, findSessionMember } from "../models/sessionModel";
 import { crdtMergeService, CrdtMergeServiceError, CRDT_FIELD_NAMES } from "./crdtMergeService";
@@ -46,6 +48,7 @@ import {
   findSnapshotsBySession,
   insertCanvasSnapshot
 } from "../models/snapshotModel";
+import { invalidateSessionGraphicsCache } from "./snapshotCacheService";
 
 type DbOperationType = "create" | "update" | "delete";
 type ConflictType = "none" | "field_merge" | "field_conflict" | "delete_wins" | "duplicate_operation";
@@ -98,6 +101,112 @@ const toNumber = (value: unknown, fallback = 0): number => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const sleep = async (ms: number): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), ms);
+  });
+};
+
+type PerfMetricPayload = Record<string, string | number | boolean>;
+
+const perfNow = (): number => {
+  return Date.now();
+};
+
+const logPerfMetric = (name: string, payload: PerfMetricPayload): void => {
+  if (!env.perfMetricsEnabled) {
+    return;
+  }
+  const metrics = Object.entries(payload)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" ");
+  console.log(`[perf] ${name} ${metrics}`);
+};
+
+// Redis 幂等键：同一个 operationId 在 TTL 窗口内只应被执行一次。
+const buildOpDedupeKey = (operationId: string): string => `op:dedupe:${operationId}`;
+
+const tryAcquireOpDedupe = async (operationId: string): Promise<"acquired" | "exists" | "disabled"> => {
+  // Redis 不可用时降级到数据库唯一键去重，避免功能不可用。
+  if (!env.redisEnabled || !isRedisReady()) {
+    return "disabled";
+  }
+  const client = getRedisClient();
+  if (!client) {
+    return "disabled";
+  }
+  const result = await client.set(buildOpDedupeKey(operationId), "processing", {
+    NX: true,
+    EX: env.redisOpDedupeTtlSeconds
+  });
+  return result === "OK" ? "acquired" : "exists";
+};
+
+const markOpDedupeDone = async (operationId: string): Promise<void> => {
+  if (!env.redisEnabled || !isRedisReady()) {
+    return;
+  }
+  const client = getRedisClient();
+  if (!client) {
+    return;
+  }
+  await client.set(buildOpDedupeKey(operationId), "done", {
+    EX: env.redisOpDedupeTtlSeconds
+  });
+};
+
+const releaseOpDedupe = async (operationId: string): Promise<void> => {
+  if (!env.redisEnabled || !isRedisReady()) {
+    return;
+  }
+  const client = getRedisClient();
+  if (!client) {
+    return;
+  }
+  await client.del(buildOpDedupeKey(operationId));
+};
+
+const isDuplicateEntryError = (error: unknown): boolean => {
+  if (!isRecord(error)) {
+    return false;
+  }
+  return String((error as { code?: string }).code ?? "") === "ER_DUP_ENTRY";
+};
+
+const buildDuplicateApplyResult = (
+  duplicated: OperationRow,
+  operationId: string,
+  objectKey: string,
+  operationType: "create_graphic" | "update_graphic" | "delete_graphic"
+): OperationApplyResult => {
+  // 幂等返回：重复请求直接复用已落库操作，不再重复推进版本号。
+  return {
+    operationRecordId: toNumber(duplicated.id),
+    resolved: {
+      operationId,
+      objectKey,
+      operationType,
+      serverVersion: toNumber(duplicated.server_version, toNumber(duplicated.version)),
+      conflictType: "duplicate_operation",
+      appliedFields: [],
+      rejectedFields: [],
+      resolveReason: "duplicate_operation_ignored"
+    }
+  };
+};
+
+const waitDuplicatedOperation = async (sessionId: number, operationId: string): Promise<OperationRow | null> => {
+  // 首次请求可能仍在事务中，短轮询等待它提交后再返回幂等结果。
+  for (let i = 0; i < 5; i += 1) {
+    const duplicated = await findOperationByOperationId(sessionId, operationId);
+    if (duplicated) {
+      return duplicated;
+    }
+    await sleep(80);
+  }
+  return null;
+};
+
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return typeof value === "object" && value !== null;
 };
@@ -141,6 +250,7 @@ const normalizeMeta = (
   objectKey: string,
   raw?: OperationMeta
 ): Required<OperationMeta> & { operationId: string } => {
+  // 统一补齐协同元信息，兼容旧客户端缺字段的情况。
   const operationId = typeof raw?.operationId === "string" && raw.operationId.trim().length > 0
     ? raw.operationId.trim()
     : `${operationType}_${objectKey}_${randomOpId()}`;
@@ -157,18 +267,35 @@ const normalizeMeta = (
 };
 
 const assertSessionAccess = async (sessionId: number, userId: number): Promise<number> => {
-  const currentVersion = await findSessionCurrentVersion(sessionId);
-  if (currentVersion === null) {
+  const sessionVersion = await findSessionCurrentVersion(sessionId);
+  if (sessionVersion === null) {
     throw new OperationServiceError("SESSION_NOT_FOUND", "会话不存在");
   }
+  const session = await dbPool.query<Array<{ status: number; is_paused: number } & RowDataPacket>>(
+    "SELECT status, is_paused FROM sessions WHERE id = ? LIMIT 1",
+    [sessionId]
+  );
+  const status = session[0]?.[0]?.status ?? 1;
+  const isPaused = (session[0]?.[0]?.is_paused ?? 0) === 1;
   const member = await findSessionMember(sessionId, userId);
   if (!member || member.membership_status !== "active") {
     throw new OperationServiceError("SESSION_FORBIDDEN", "无会话访问权限");
   }
-  return currentVersion;
+  if (status !== 1) {
+    throw new OperationServiceError("SESSION_FORBIDDEN", "会话已结束，不能编辑画布");
+  }
+  if (isPaused) {
+    throw new OperationServiceError("SESSION_FORBIDDEN", "画布已暂停编辑");
+  }
+  if (member.role === 0) {
+    throw new OperationServiceError("SESSION_FORBIDDEN", "只读成员无编辑权限");
+  }
+  // 返回当前版本，供后续生成默认 baseVersion。
+  return sessionVersion;
 };
 
 const markRedoHistoryAsInvalid = async (connection: PoolConnection, userId: number, sessionId: number): Promise<void> => {
+  // 出现新操作后，旧的 redo 链需要全部失效。
   await connection.execute(
     "UPDATE user_operation_history SET can_redo = 0 WHERE user_id = ? AND session_id = ? AND can_redo = 1",
     [userId, sessionId]
@@ -181,6 +308,7 @@ const insertUserOperationHistory = async (
   sessionId: number,
   operationRecordId: number
 ): Promise<void> => {
+  // 记录用户历史，供后续 undo/redo 定位最近可操作项。
   await connection.execute(
     "INSERT INTO user_operation_history (user_id, session_id, operation_id, undo_operation_id, can_undo, can_redo) VALUES (?, ?, ?, NULL, 1, 0)",
     [userId, sessionId, operationRecordId]
@@ -197,20 +325,19 @@ const updateFieldVersions = async (
   serverVersion: number,
   fields: string[]
 ): Promise<void> => {
-  for (const fieldName of fields) {
-    await upsertGraphicFieldVersion(
-      {
-        sessionId,
-        objectKey,
-        fieldName,
-        lamportTime,
-        serverVersion,
-        clientId,
-        updatedBy: userId
-      },
-      connection
-    );
-  }
+  // CRDT 字段级版本推进，支撑并发冲突合并策略。
+  await upsertGraphicFieldVersionsBatch(
+    fields.map((fieldName) => ({
+      sessionId,
+      objectKey,
+      fieldName,
+      lamportTime,
+      serverVersion,
+      clientId,
+      updatedBy: userId
+    })),
+    connection
+  );
 };
 
 const toUpdatePatch = (graphic: GraphicVO): UpdateGraphicDTO => ({
@@ -219,11 +346,14 @@ const toUpdatePatch = (graphic: GraphicVO): UpdateGraphicDTO => ({
   width: graphic.width ?? undefined,
   height: graphic.height ?? undefined,
   strokeColor: graphic.strokeColor,
+  lineStyle: graphic.lineStyle,
   fillColor: graphic.fillColor ?? undefined,
   strokeWidth: graphic.strokeWidth,
   textContent: graphic.textContent ?? undefined,
   fontSize: graphic.fontSize ?? undefined,
   pathPoints: graphic.pathPoints ?? undefined,
+  isLocked: graphic.isLocked,
+  rotation: graphic.rotation,
   zIndex: graphic.zIndex
 });
 
@@ -291,8 +421,12 @@ const toSessionSnapshotItemVO = (row: CanvasSnapshotRow): SessionSnapshotItemVO 
     id: row.id,
     sessionId: row.session_id,
     version: toNumber(row.version),
+    ...(typeof row.snapshot_name === "string" && row.snapshot_name.trim().length > 0 ? { snapshotName: row.snapshot_name } : {}),
     graphicCount: toNumber(row.graphic_count),
     ...(typeof row.created_by === "number" ? { createdBy: row.created_by } : {}),
+    ...(typeof row.created_by_name === "string" && row.created_by_name.trim().length > 0
+      ? { createdByName: row.created_by_name }
+      : {}),
     createdAt: toIsoString(row.created_at)
   };
 };
@@ -315,6 +449,7 @@ const insertOperationAndHistory = async (
   },
   options?: OperationWriteOptions
 ): Promise<number> => {
+  // 保证 operation 与历史记录在同一事务中写入，避免链路断裂。
   const operationRecordId = await insertOperationRecord(input, connection);
   if (options?.skipUserHistory) {
     return operationRecordId;
@@ -331,33 +466,40 @@ const createGraphic = async (
   meta?: OperationMeta,
   options?: OperationWriteOptions
 ): Promise<OperationApplyResult> => {
+  const metricStart = perfNow();
+  let metricPayload: PerfMetricPayload = { sessionId, result: "ok" };
   const currentVersion = await assertSessionAccess(sessionId, userId);
   const normalizedMeta = normalizeMeta(currentVersion, "create_graphic", data.objectKey, meta);
+  // 先做 Redis 侧幂等锁，减少重复请求冲击数据库。
+  const dedupeState = await tryAcquireOpDedupe(normalizedMeta.operationId).catch(() => "disabled" as const);
+  const dedupeOwned = dedupeState === "acquired";
+    if (dedupeState === "exists") {
+      const duplicated = await waitDuplicatedOperation(sessionId, normalizedMeta.operationId);
+      if (duplicated) {
+        metricPayload = { ...metricPayload, dedupe: "redis_exists", duplicateHit: true, result: "duplicate" };
+        return buildDuplicateApplyResult(duplicated, normalizedMeta.operationId, data.objectKey, "create_graphic");
+      }
+    }
 
   const existing = await findGraphicByObjectKey(sessionId, data.objectKey, true);
   if (existing && existing.is_deleted === 0) {
+    if (dedupeOwned) {
+      await releaseOpDedupe(normalizedMeta.operationId).catch(() => {
+        // ignore redis failure
+      });
+    }
     throw new OperationServiceError("GRAPHIC_EXISTS", "图形对象已存在");
   }
 
   const connection = await dbPool.getConnection();
   try {
     await connection.beginTransaction();
+    // 再做数据库侧二次幂等校验，兜住 Redis 异常场景。
     const duplicated = await findOperationByOperationId(sessionId, normalizedMeta.operationId, connection);
     if (duplicated) {
       await connection.commit();
-      return {
-        operationRecordId: toNumber(duplicated.id),
-        resolved: {
-          operationId: normalizedMeta.operationId,
-          objectKey: data.objectKey,
-          operationType: "create_graphic",
-          serverVersion: toNumber(duplicated.server_version, toNumber(duplicated.version)),
-          conflictType: "duplicate_operation",
-          appliedFields: [],
-          rejectedFields: [],
-          resolveReason: "duplicate_operation_ignored"
-        }
-      };
+      metricPayload = { ...metricPayload, dedupe: "db_exists", duplicateHit: true, result: "duplicate" };
+      return buildDuplicateApplyResult(duplicated, normalizedMeta.operationId, data.objectKey, "create_graphic");
     }
 
     const nextVersion = await incrementSessionVersion(sessionId, connection);
@@ -367,11 +509,12 @@ const createGraphic = async (
 
     let graphicId: number;
     if (existing && existing.is_deleted === 1) {
+      // 同 objectKey 的软删除对象允许“复活”，保证 objectKey 语义稳定。
       await connection.execute(
         `UPDATE graphic_objects
          SET is_deleted = 0, deleted_version = NULL, deleted_by = NULL, deleted_at = NULL,
              object_type = ?, position_x = ?, position_y = ?, width = ?, height = ?,
-             stroke_color = ?, fill_color = ?, stroke_width = ?, text_content = ?, font_size = ?, path_points = ?,
+             stroke_color = ?, line_style = ?, fill_color = ?, stroke_width = ?, text_content = ?, font_size = ?, path_points = ?, is_locked = ?, rotation = ?,
              z_index = ?, version = ?, updated_at = NOW()
          WHERE id = ?`,
         [
@@ -381,11 +524,14 @@ const createGraphic = async (
           data.width ?? null,
           data.height ?? null,
           data.strokeColor,
+          data.lineStyle === "dashed" ? "dashed" : "solid",
           data.fillColor ?? null,
           data.strokeWidth,
           data.textContent ?? null,
           data.fontSize ?? null,
           data.pathPoints ? JSON.stringify(data.pathPoints) : null,
+          data.isLocked === true ? 1 : 0,
+          typeof data.rotation === "number" ? data.rotation : 0,
           data.zIndex,
           nextVersion,
           existing.id
@@ -403,11 +549,14 @@ const createGraphic = async (
           width: data.width ?? null,
           height: data.height ?? null,
           strokeColor: data.strokeColor,
+          lineStyle: data.lineStyle === "dashed" ? "dashed" : "solid",
           fillColor: data.fillColor ?? null,
           strokeWidth: data.strokeWidth,
           textContent: data.textContent ?? null,
           fontSize: data.fontSize ?? null,
           pathPoints: data.pathPoints ? JSON.stringify(data.pathPoints) : null,
+          isLocked: data.isLocked === true,
+          rotation: typeof data.rotation === "number" ? data.rotation : 0,
           zIndex: data.zIndex,
           version: nextVersion,
           creatorId: userId
@@ -422,6 +571,7 @@ const createGraphic = async (
     }
     const createdGraphic = crdtMergeService.toGraphicVO(createdRow);
     const allFields = CRDT_FIELD_NAMES.map((item) => item as string);
+    // 创建对象默认视为所有字段都已被本次操作写入。
     await updateFieldVersions(
       connection,
       sessionId,
@@ -454,6 +604,14 @@ const createGraphic = async (
     }, options);
 
     await connection.commit();
+    await invalidateSessionGraphicsCache(sessionId).catch(() => {
+      // ignore redis cache error
+    });
+    if (dedupeOwned) {
+      await markOpDedupeDone(normalizedMeta.operationId).catch(() => {
+        // ignore redis failure
+      });
+    }
     return {
       graphic: createdGraphic,
       operationRecordId,
@@ -470,8 +628,30 @@ const createGraphic = async (
     };
   } catch (error) {
     await connection.rollback();
+    if (isDuplicateEntryError(error)) {
+      const duplicated = await findOperationByOperationId(sessionId, normalizedMeta.operationId).catch(() => null);
+      if (duplicated) {
+        if (dedupeOwned) {
+          await markOpDedupeDone(normalizedMeta.operationId).catch(() => {
+            // ignore redis failure
+          });
+        }
+        metricPayload = { ...metricPayload, dedupe: "db_unique_fallback", duplicateHit: true, result: "duplicate" };
+        return buildDuplicateApplyResult(duplicated, normalizedMeta.operationId, data.objectKey, "create_graphic");
+      }
+    }
+    if (dedupeOwned) {
+      await releaseOpDedupe(normalizedMeta.operationId).catch(() => {
+        // ignore redis failure
+      });
+    }
+    metricPayload = { ...metricPayload, result: "error" };
     throw error;
   } finally {
+    logPerfMetric("operation.createGraphic", {
+      ...metricPayload,
+      durationMs: perfNow() - metricStart
+    });
     connection.release();
   }
 };
@@ -484,10 +664,27 @@ const updateGraphic = async (
   meta?: OperationMeta,
   options?: OperationWriteOptions
 ): Promise<OperationApplyResult> => {
+  const metricStart = perfNow();
+  let metricPayload: PerfMetricPayload = { sessionId, result: "ok" };
   const currentVersion = await assertSessionAccess(sessionId, userId);
   const normalizedMeta = normalizeMeta(currentVersion, "update_graphic", objectKey, meta);
+  // 更新操作同样使用 operationId 去重，避免前端重试造成重复写入。
+  const dedupeState = await tryAcquireOpDedupe(normalizedMeta.operationId).catch(() => "disabled" as const);
+  const dedupeOwned = dedupeState === "acquired";
+  if (dedupeState === "exists") {
+    const duplicated = await waitDuplicatedOperation(sessionId, normalizedMeta.operationId);
+    if (duplicated) {
+      metricPayload = { ...metricPayload, dedupe: "redis_exists", duplicateHit: true, result: "duplicate" };
+      return buildDuplicateApplyResult(duplicated, normalizedMeta.operationId, objectKey, "update_graphic");
+    }
+  }
   const patchKeys = Object.keys(patch).filter((item) => typeof (patch as Record<string, unknown>)[item] !== "undefined");
   if (patchKeys.length === 0) {
+    if (dedupeOwned) {
+      await releaseOpDedupe(normalizedMeta.operationId).catch(() => {
+        // ignore redis failure
+      });
+    }
     throw new OperationServiceError("INVALID_ARGUMENT", "更新参数不能为空");
   }
 
@@ -497,17 +694,71 @@ const updateGraphic = async (
     const duplicated = await findOperationByOperationId(sessionId, normalizedMeta.operationId, connection);
     if (duplicated) {
       await connection.commit();
+      metricPayload = { ...metricPayload, dedupe: "db_exists", duplicateHit: true, result: "duplicate" };
+      return buildDuplicateApplyResult(duplicated, normalizedMeta.operationId, objectKey, "update_graphic");
+    }
+
+    const target = await findGraphicByObjectKey(sessionId, objectKey, true, connection);
+    if (!target) {
+      throw new OperationServiceError("GRAPHIC_NOT_FOUND", "图形对象不存在");
+    }
+    if (target.is_deleted === 1) {
+      // 对象已被并发删除时，按 tombstone 规则拒绝更新并记录冲突。
+      const nextVersion = await incrementSessionVersion(sessionId, connection);
+      if (nextVersion === null) {
+        throw new OperationServiceError("SESSION_NOT_FOUND", "会话不存在");
+      }
+      const resolvedResult = {
+        operationType: "update_graphic",
+        objectKey,
+        beforeGraphic: crdtMergeService.toGraphicVO(target),
+        appliedFields: [],
+        rejectedFields: patchKeys,
+        resolveReason: "delete_tombstone_blocked_update"
+      };
+      const operationRecordId = await insertOperationAndHistory(connection, {
+        operationId: normalizedMeta.operationId,
+        sessionId,
+        userId,
+        objectKey,
+        operationType: "update",
+        operationData: { ...patch },
+        baseVersion: normalizedMeta.baseVersion,
+        serverVersion: nextVersion,
+        lamportTime: normalizedMeta.lamportTime,
+        clientId: normalizedMeta.clientId,
+        resolvedResult,
+        conflictType: "delete_wins"
+      }, options);
+
+      await insertConflictLogsBatch(
+        patchKeys.map((fieldName) => ({
+          operationRefId: operationRecordId,
+          operationId: normalizedMeta.operationId,
+          sessionId,
+          objectKey,
+          conflictType: "delete_wins" as const,
+          fieldName,
+          currentValue: (target as unknown as Record<string, unknown>)[fieldName],
+          incomingValue: (patch as Record<string, unknown>)[fieldName],
+          resolvedValue: null,
+          resolveStrategy: "delete_wins_tombstone"
+        })),
+        connection
+      );
+
+      await connection.commit();
       return {
-        operationRecordId: toNumber(duplicated.id),
+        operationRecordId,
         resolved: {
           operationId: normalizedMeta.operationId,
           objectKey,
           operationType: "update_graphic",
-          serverVersion: toNumber(duplicated.server_version, toNumber(duplicated.version)),
-          conflictType: "duplicate_operation",
+          serverVersion: nextVersion,
+          conflictType: "delete_wins",
           appliedFields: [],
-          rejectedFields: [],
-          resolveReason: "duplicate_operation_ignored"
+          rejectedFields: patchKeys,
+          resolveReason: "delete_tombstone_blocked_update"
         }
       };
     }
@@ -544,6 +795,7 @@ const updateGraphic = async (
           ? mergeResult.mergedPatch.height
           : undefined,
         strokeColor: mergeResult.mergedPatch.strokeColor,
+        lineStyle: typeof mergeResult.mergedPatch.lineStyle === "string" ? mergeResult.mergedPatch.lineStyle : undefined,
         fillColor: typeof mergeResult.mergedPatch.fillColor === "string" || mergeResult.mergedPatch.fillColor === null
           ? mergeResult.mergedPatch.fillColor
           : undefined,
@@ -559,6 +811,8 @@ const updateGraphic = async (
           : mergeResult.mergedPatch.pathPoints === null
             ? null
             : undefined,
+        isLocked: typeof mergeResult.mergedPatch.isLocked === "boolean" ? mergeResult.mergedPatch.isLocked : undefined,
+        rotation: typeof mergeResult.mergedPatch.rotation === "number" ? mergeResult.mergedPatch.rotation : undefined,
         zIndex: mergeResult.mergedPatch.zIndex
       },
       nextVersion,
@@ -606,26 +860,33 @@ const updateGraphic = async (
     }, options);
 
     if (mergeResult.conflictType !== "none" || mergeResult.rejectedFields.length > 0) {
-      for (const fieldName of mergeResult.rejectedFields) {
-        await insertConflictLog(
-          {
-            operationRefId: operationRecordId,
-            operationId: normalizedMeta.operationId,
-            sessionId,
-            objectKey,
-            conflictType: mergeResult.conflictType,
-            fieldName,
-            currentValue: (mergeResult.targetGraphic as unknown as Record<string, unknown>)[fieldName],
-            incomingValue: (patch as Record<string, unknown>)[fieldName],
-            resolvedValue: (toUpdatePatch(updatedGraphic) as Record<string, unknown>)[fieldName],
-            resolveStrategy: "lamport_then_client_id"
-          },
-          connection
-        );
-      }
+      // 字段冲突会写入 conflict_logs，便于后续排查“谁覆盖了谁”。
+      await insertConflictLogsBatch(
+        mergeResult.rejectedFields.map((fieldName) => ({
+          operationRefId: operationRecordId,
+          operationId: normalizedMeta.operationId,
+          sessionId,
+          objectKey,
+          conflictType: mergeResult.conflictType,
+          fieldName,
+          currentValue: (mergeResult.targetGraphic as unknown as Record<string, unknown>)[fieldName],
+          incomingValue: (patch as Record<string, unknown>)[fieldName],
+          resolvedValue: (toUpdatePatch(updatedGraphic) as Record<string, unknown>)[fieldName],
+          resolveStrategy: "lamport_then_client_id"
+        })),
+        connection
+      );
     }
 
     await connection.commit();
+    await invalidateSessionGraphicsCache(sessionId).catch(() => {
+      // ignore redis cache error
+    });
+    if (dedupeOwned) {
+      await markOpDedupeDone(normalizedMeta.operationId).catch(() => {
+        // ignore redis failure
+      });
+    }
     return {
       graphic: updatedGraphic,
       operationRecordId,
@@ -642,14 +903,42 @@ const updateGraphic = async (
     };
   } catch (error) {
     await connection.rollback();
+    if (isDuplicateEntryError(error)) {
+      const duplicated = await findOperationByOperationId(sessionId, normalizedMeta.operationId).catch(() => null);
+      if (duplicated) {
+        if (dedupeOwned) {
+          await markOpDedupeDone(normalizedMeta.operationId).catch(() => {
+            // ignore redis failure
+          });
+        }
+        metricPayload = { ...metricPayload, dedupe: "db_unique_fallback", duplicateHit: true, result: "duplicate" };
+        return buildDuplicateApplyResult(duplicated, normalizedMeta.operationId, objectKey, "update_graphic");
+      }
+    }
     if (error instanceof CrdtMergeServiceError) {
+      if (dedupeOwned) {
+        await releaseOpDedupe(normalizedMeta.operationId).catch(() => {
+          // ignore redis failure
+        });
+      }
       if (error.code === "GRAPHIC_NOT_FOUND") {
         throw new OperationServiceError("GRAPHIC_NOT_FOUND", "图形对象不存在");
       }
       throw new OperationServiceError("GRAPHIC_NOT_FOUND", "图形对象已删除");
     }
+    if (dedupeOwned) {
+      await releaseOpDedupe(normalizedMeta.operationId).catch(() => {
+        // ignore redis failure
+      });
+    }
+    metricPayload = { ...metricPayload, result: "error" };
     throw error;
   } finally {
+    logPerfMetric("operation.updateGraphic", {
+      ...metricPayload,
+      patchFieldCount: patchKeys.length,
+      durationMs: perfNow() - metricStart
+    });
     connection.release();
   }
 };
@@ -661,8 +950,20 @@ const deleteGraphic = async (
   meta?: OperationMeta,
   options?: OperationWriteOptions
 ): Promise<OperationApplyResult> => {
+  const metricStart = perfNow();
+  let metricPayload: PerfMetricPayload = { sessionId, result: "ok" };
   const currentVersion = await assertSessionAccess(sessionId, userId);
   const normalizedMeta = normalizeMeta(currentVersion, "delete_graphic", objectKey, meta);
+  // 删除也要幂等：重复删除不应反复推进版本。
+  const dedupeState = await tryAcquireOpDedupe(normalizedMeta.operationId).catch(() => "disabled" as const);
+  const dedupeOwned = dedupeState === "acquired";
+  if (dedupeState === "exists") {
+    const duplicated = await waitDuplicatedOperation(sessionId, normalizedMeta.operationId);
+    if (duplicated) {
+      metricPayload = { ...metricPayload, dedupe: "redis_exists", duplicateHit: true, result: "duplicate" };
+      return buildDuplicateApplyResult(duplicated, normalizedMeta.operationId, objectKey, "delete_graphic");
+    }
+  }
 
   const connection = await dbPool.getConnection();
   try {
@@ -670,19 +971,8 @@ const deleteGraphic = async (
     const duplicated = await findOperationByOperationId(sessionId, normalizedMeta.operationId, connection);
     if (duplicated) {
       await connection.commit();
-      return {
-        operationRecordId: toNumber(duplicated.id),
-        resolved: {
-          operationId: normalizedMeta.operationId,
-          objectKey,
-          operationType: "delete_graphic",
-          serverVersion: toNumber(duplicated.server_version, toNumber(duplicated.version)),
-          conflictType: "duplicate_operation",
-          appliedFields: [],
-          rejectedFields: [],
-          resolveReason: "duplicate_operation_ignored"
-        }
-      };
+      metricPayload = { ...metricPayload, dedupe: "db_exists", duplicateHit: true, result: "duplicate" };
+      return buildDuplicateApplyResult(duplicated, normalizedMeta.operationId, objectKey, "delete_graphic");
     }
 
     const target = await findGraphicByObjectKey(sessionId, objectKey, true, connection);
@@ -699,6 +989,7 @@ const deleteGraphic = async (
     }
 
     await softDeleteGraphicById(target.id, nextVersion, connection);
+    // 额外记录删除版本与操作者，方便版本回放与审计。
     await connection.execute(
       `UPDATE graphic_objects
        SET deleted_version = ?, deleted_by = ?, deleted_at = NOW()
@@ -724,10 +1015,18 @@ const deleteGraphic = async (
       lamportTime: normalizedMeta.lamportTime,
       clientId: normalizedMeta.clientId,
       resolvedResult,
-      conflictType: "delete_wins"
+      conflictType: "none"
     }, options);
 
     await connection.commit();
+    await invalidateSessionGraphicsCache(sessionId).catch(() => {
+      // ignore redis cache error
+    });
+    if (dedupeOwned) {
+      await markOpDedupeDone(normalizedMeta.operationId).catch(() => {
+        // ignore redis failure
+      });
+    }
     return {
       deletedObjectKey: objectKey,
       operationRecordId,
@@ -736,16 +1035,38 @@ const deleteGraphic = async (
         objectKey,
         operationType: "delete_graphic",
         serverVersion: nextVersion,
-        conflictType: "delete_wins",
+        conflictType: "none",
         appliedFields: ["delete"],
         rejectedFields: [],
-        resolveReason: "delete_tombstone_applied"
+        resolveReason: "deleted"
       }
     };
   } catch (error) {
     await connection.rollback();
+    if (isDuplicateEntryError(error)) {
+      const duplicated = await findOperationByOperationId(sessionId, normalizedMeta.operationId).catch(() => null);
+      if (duplicated) {
+        if (dedupeOwned) {
+          await markOpDedupeDone(normalizedMeta.operationId).catch(() => {
+            // ignore redis failure
+          });
+        }
+        metricPayload = { ...metricPayload, dedupe: "db_unique_fallback", duplicateHit: true, result: "duplicate" };
+        return buildDuplicateApplyResult(duplicated, normalizedMeta.operationId, objectKey, "delete_graphic");
+      }
+    }
+    if (dedupeOwned) {
+      await releaseOpDedupe(normalizedMeta.operationId).catch(() => {
+        // ignore redis failure
+      });
+    }
+    metricPayload = { ...metricPayload, result: "error" };
     throw error;
   } finally {
+    logPerfMetric("operation.deleteGraphic", {
+      ...metricPayload,
+      durationMs: perfNow() - metricStart
+    });
     connection.release();
   }
 };
@@ -802,6 +1123,172 @@ const getSessionOperationTimelineBySessionKey = async (
   const pageSize = Number.isInteger(query.pageSize) && query.pageSize > 0 ? Math.min(query.pageSize, 100) : 20;
   const offset = (page - 1) * pageSize;
 
+  type RestoreAgg = {
+    restoreClientId: string;
+    sessionId: number;
+    userId: number;
+    baseVersion: number;
+    targetVersion: number | null;
+    restoredVersion: number;
+    timestamp: number;
+    createdCount: number;
+    updatedCount: number;
+    deletedCount: number;
+  };
+
+  const parseRestoreTargetVersion = (clientId: string): number | null => {
+    const matched = clientId.match(/^restore_\d+_tv_(\d+)_/);
+    if (!matched) {
+      return null;
+    }
+    const parsed = Number(matched[1]);
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+  };
+
+  const aggregateRestoreRows = (rows: OperationRow[]): RestoreAgg[] => {
+    const groups = new Map<string, RestoreAgg>();
+    rows.forEach((row) => {
+      const rawClientId = typeof row.client_id === "string" ? row.client_id : "";
+      const rawOperationId = typeof row.operation_id === "string" ? row.operation_id : "";
+      const restoreClientId = rawClientId.startsWith("restore_")
+        ? rawClientId
+        : (rawOperationId.startsWith("rs_") ? `restore_by_op_${rawOperationId}` : "");
+      if (!restoreClientId) {
+        return;
+      }
+      const current = groups.get(restoreClientId);
+      const createdInc = row.operation_type === "create" ? 1 : 0;
+      const updatedInc = row.operation_type === "update" ? 1 : 0;
+      const deletedInc = row.operation_type === "delete" ? 1 : 0;
+      if (!current) {
+        groups.set(restoreClientId, {
+          restoreClientId,
+          sessionId: row.session_id,
+          userId: row.user_id,
+          baseVersion: toNumber(row.base_version),
+          targetVersion: parseRestoreTargetVersion(rawClientId),
+          restoredVersion: toNumber(row.server_version, toNumber(row.version)),
+          timestamp: toNumber(row.timestamp),
+          createdCount: createdInc,
+          updatedCount: updatedInc,
+          deletedCount: deletedInc
+        });
+        return;
+      }
+      current.baseVersion = Math.min(current.baseVersion, toNumber(row.base_version));
+      current.restoredVersion = Math.max(current.restoredVersion, toNumber(row.server_version, toNumber(row.version)));
+      current.timestamp = Math.max(current.timestamp, toNumber(row.timestamp));
+      current.createdCount += createdInc;
+      current.updatedCount += updatedInc;
+      current.deletedCount += deletedInc;
+    });
+    return Array.from(groups.values()).sort((a, b) => b.timestamp - a.timestamp);
+  };
+
+  const toRestoreTimelineVO = (items: RestoreAgg[], startIndex = 0): SessionOperationItemVO[] => {
+    return items.map((item, idx) => ({
+      id: -(startIndex + idx + 1),
+      operationId: `restore_event_${item.restoreClientId}`,
+      sessionId: item.sessionId,
+      userId: item.userId,
+      objectKey: "__restore_snapshot__",
+      operationType: "update",
+      operationData: {
+        __systemEvent: "restore_version",
+        ...(typeof item.targetVersion === "number" ? { targetVersion: item.targetVersion } : {}),
+        previousVersion: item.baseVersion,
+        restoredVersion: item.restoredVersion,
+        createdCount: item.createdCount,
+        updatedCount: item.updatedCount,
+        deletedCount: item.deletedCount
+      },
+      baseVersion: item.baseVersion,
+      serverVersion: item.restoredVersion,
+      lamportTime: item.timestamp,
+      clientId: "system_restore_event",
+      resolvedResult: {},
+      conflictType: "none",
+      timestamp: item.timestamp
+    }));
+  };
+
+  if (query.operationType === "restore") {
+    const restoreRows = await findOperationsByTimelineQuery({
+      sessionId: session.id,
+      fromVersion: query.fromVersion,
+      toVersion: query.toVersion,
+      userId: query.userId,
+      conflictType: query.conflictType,
+      restoreFilter: "only",
+      offset: 0,
+      limit: 10000
+    });
+    const aggregated = aggregateRestoreRows(restoreRows);
+    const paged = aggregated.slice(offset, offset + pageSize);
+    const list = toRestoreTimelineVO(paged, offset);
+
+    return {
+      sessionId: session.id,
+      sessionKey: session.session_key,
+      currentVersion: toNumber(session.current_version),
+      page,
+      pageSize,
+      total: aggregated.length,
+      list
+    };
+  }
+
+  if (typeof query.operationType === "undefined") {
+    const [normalTotal, normalRows, restoreRows] = await Promise.all([
+      countOperationsByTimelineQuery({
+        sessionId: session.id,
+        fromVersion: query.fromVersion,
+        toVersion: query.toVersion,
+        userId: query.userId,
+        conflictType: query.conflictType,
+        restoreFilter: "exclude",
+        offset: 0,
+        limit: pageSize
+      }),
+      findOperationsByTimelineQuery({
+        sessionId: session.id,
+        fromVersion: query.fromVersion,
+        toVersion: query.toVersion,
+        userId: query.userId,
+        conflictType: query.conflictType,
+        restoreFilter: "exclude",
+        offset: 0,
+        limit: 10000
+      }),
+      findOperationsByTimelineQuery({
+        sessionId: session.id,
+        fromVersion: query.fromVersion,
+        toVersion: query.toVersion,
+        userId: query.userId,
+        conflictType: query.conflictType,
+        restoreFilter: "only",
+        offset: 0,
+        limit: 10000
+      })
+    ]);
+
+    const restoreAgg = aggregateRestoreRows(restoreRows);
+    const restoreList = toRestoreTimelineVO(restoreAgg, 0);
+    const normalList = normalRows.map(toSessionOperationItemVO);
+    const merged = [...normalList, ...restoreList].sort((a, b) => b.timestamp - a.timestamp);
+    const paged = merged.slice(offset, offset + pageSize);
+
+    return {
+      sessionId: session.id,
+      sessionKey: session.session_key,
+      currentVersion: toNumber(session.current_version),
+      page,
+      pageSize,
+      total: normalTotal + restoreAgg.length,
+      list: paged
+    };
+  }
+
   const [total, rows] = await Promise.all([
     countOperationsByTimelineQuery({
       sessionId: session.id,
@@ -810,6 +1297,7 @@ const getSessionOperationTimelineBySessionKey = async (
       userId: query.userId,
       operationType: query.operationType,
       conflictType: query.conflictType,
+      restoreFilter: "exclude",
       offset,
       limit: pageSize
     }),
@@ -820,6 +1308,7 @@ const getSessionOperationTimelineBySessionKey = async (
       userId: query.userId,
       operationType: query.operationType,
       conflictType: query.conflictType,
+      restoreFilter: "exclude",
       offset,
       limit: pageSize
     })
@@ -866,7 +1355,8 @@ const getSessionConflictLogsBySessionKey = async (
 
 const createSessionSnapshotBySessionKey = async (
   sessionKey: string,
-  userId: number
+  userId: number,
+  snapshotName?: string
 ): Promise<SessionSnapshotItemVO> => {
   const session = await findSessionBySessionKey(sessionKey);
   if (!session) {
@@ -876,9 +1366,15 @@ const createSessionSnapshotBySessionKey = async (
   if (!member || member.membership_status !== "active") {
     throw new OperationServiceError("SESSION_FORBIDDEN", "无会话访问权限");
   }
+  if (member.role === 0) {
+    throw new OperationServiceError("SESSION_FORBIDDEN", "只读成员无创建快照权限");
+  }
 
   const graphics = await findGraphicsBySessionId(session.id);
   const currentVersion = toNumber(session.current_version);
+  const normalizedSnapshotName = typeof snapshotName === "string" && snapshotName.trim().length > 0
+    ? snapshotName.trim()
+    : `快照 ${new Date().toLocaleString("zh-CN", { hour12: false })}`;
   const snapshotData = {
     sessionId: session.id,
     sessionKey: session.session_key,
@@ -888,6 +1384,7 @@ const createSessionSnapshotBySessionKey = async (
   const snapshotId = await insertCanvasSnapshot({
     sessionId: session.id,
     version: currentVersion,
+    snapshotName: normalizedSnapshotName,
     snapshotData,
     graphicCount: graphics.length,
     createdBy: userId
@@ -897,6 +1394,7 @@ const createSessionSnapshotBySessionKey = async (
     id: snapshotId,
     sessionId: session.id,
     version: currentVersion,
+    snapshotName: normalizedSnapshotName,
     graphicCount: graphics.length,
     createdBy: userId,
     createdAt: new Date().toISOString()
@@ -983,7 +1481,8 @@ const graphicToCreateDTO = (graphic: Record<string, unknown>): CreateGraphicDTO 
     objectTypeRaw === "rect" ||
     objectTypeRaw === "circle" ||
     objectTypeRaw === "text" ||
-    objectTypeRaw === "path"
+    objectTypeRaw === "path" ||
+    objectTypeRaw === "image"
   ) ? objectTypeRaw : "line";
 
   const pathPoints = Array.isArray(graphic.pathPoints)
@@ -1001,45 +1500,114 @@ const graphicToCreateDTO = (graphic: Record<string, unknown>): CreateGraphicDTO 
     ...(typeof graphic.width === "number" ? { width: graphic.width } : {}),
     ...(typeof graphic.height === "number" ? { height: graphic.height } : {}),
     strokeColor: typeof graphic.strokeColor === "string" ? graphic.strokeColor : "#000000",
+    ...(graphic.lineStyle === "dashed" || graphic.lineStyle === "solid" ? { lineStyle: graphic.lineStyle } : {}),
     ...(typeof graphic.fillColor === "string" ? { fillColor: graphic.fillColor } : {}),
     strokeWidth: toNumber(graphic.strokeWidth, 1),
     ...(typeof graphic.textContent === "string" ? { textContent: graphic.textContent } : {}),
     ...(typeof graphic.fontSize === "number" ? { fontSize: graphic.fontSize } : {}),
     ...(pathPoints && pathPoints.length > 0 ? { pathPoints } : {}),
+    ...(typeof graphic.isLocked === "boolean" ? { isLocked: graphic.isLocked } : {}),
+    ...(typeof graphic.rotation === "number" ? { rotation: graphic.rotation } : {}),
     zIndex: toNumber(graphic.zIndex)
   };
 };
 
-const graphicToUpdatePatch = (graphic: Record<string, unknown>): UpdateGraphicDTO => {
-  const patch: UpdateGraphicDTO = {
+// 恢复版本需要支持把字段“清空”为 null，故这里使用宽松 patch 类型。
+const graphicToUpdatePatch = (graphic: Record<string, unknown>): Record<string, unknown> => {
+  const patch: Record<string, unknown> = {
     positionX: toNumber(graphic.positionX),
     positionY: toNumber(graphic.positionY),
     strokeColor: typeof graphic.strokeColor === "string" ? graphic.strokeColor : "#000000",
+    ...(graphic.lineStyle === "dashed" || graphic.lineStyle === "solid" ? { lineStyle: graphic.lineStyle } : {}),
     strokeWidth: toNumber(graphic.strokeWidth, 1),
     zIndex: toNumber(graphic.zIndex)
   };
   if (typeof graphic.width === "number") {
     patch.width = graphic.width;
+  } else if (graphic.width === null) {
+    patch.width = null;
   }
   if (typeof graphic.height === "number") {
     patch.height = graphic.height;
+  } else if (graphic.height === null) {
+    patch.height = null;
   }
   if (typeof graphic.fillColor === "string") {
     patch.fillColor = graphic.fillColor;
+  } else if (graphic.fillColor === null) {
+    patch.fillColor = null;
+  }
+  if (graphic.lineStyle === "dashed" || graphic.lineStyle === "solid") {
+    patch.lineStyle = graphic.lineStyle;
   }
   if (typeof graphic.textContent === "string") {
     patch.textContent = graphic.textContent;
+  } else if (graphic.textContent === null) {
+    patch.textContent = null;
   }
   if (typeof graphic.fontSize === "number") {
     patch.fontSize = graphic.fontSize;
+  } else if (graphic.fontSize === null) {
+    patch.fontSize = null;
   }
   if (Array.isArray(graphic.pathPoints)) {
     patch.pathPoints = graphic.pathPoints
       .filter((item): item is Record<string, unknown> => isRecord(item))
       .map((item) => ({ x: toNumber(item.x), y: toNumber(item.y) }))
       .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y));
+  } else if (graphic.pathPoints === null) {
+    patch.pathPoints = null;
+  }
+  if (typeof graphic.isLocked === "boolean") {
+    patch.isLocked = graphic.isLocked;
+  }
+  if (typeof graphic.rotation === "number") {
+    patch.rotation = graphic.rotation;
   }
   return patch;
+};
+
+const toComparableGraphicState = (graphic: Record<string, unknown>): Record<string, unknown> => {
+  const objectTypeRaw = typeof graphic.objectType === "string" ? graphic.objectType : "line";
+  const objectType = (
+    objectTypeRaw === "line" ||
+    objectTypeRaw === "rect" ||
+    objectTypeRaw === "circle" ||
+    objectTypeRaw === "text" ||
+    objectTypeRaw === "path" ||
+    objectTypeRaw === "image"
+  ) ? objectTypeRaw : "line";
+  const pathPoints = Array.isArray(graphic.pathPoints)
+    ? graphic.pathPoints
+      .filter((item): item is Record<string, unknown> => isRecord(item))
+      .map((item) => ({ x: toNumber(item.x), y: toNumber(item.y) }))
+      .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y))
+    : null;
+
+  return {
+    objectType,
+    positionX: toNumber(graphic.positionX),
+    positionY: toNumber(graphic.positionY),
+    width: typeof graphic.width === "number" ? graphic.width : null,
+    height: typeof graphic.height === "number" ? graphic.height : null,
+    strokeColor: typeof graphic.strokeColor === "string" ? graphic.strokeColor : "#000000",
+    lineStyle: graphic.lineStyle === "dashed" ? "dashed" : "solid",
+    fillColor: typeof graphic.fillColor === "string" ? graphic.fillColor : null,
+    strokeWidth: toNumber(graphic.strokeWidth, 1),
+    textContent: typeof graphic.textContent === "string" ? graphic.textContent : null,
+    fontSize: typeof graphic.fontSize === "number" ? graphic.fontSize : null,
+    pathPoints,
+    isLocked: graphic.isLocked === true || graphic.isLocked === 1,
+    rotation: typeof graphic.rotation === "number" ? graphic.rotation : toNumber(graphic.rotation),
+    zIndex: toNumber(graphic.zIndex)
+  };
+};
+
+const normalizeObjectType = (value: unknown): "line" | "rect" | "circle" | "text" | "path" | "image" => {
+  if (value === "rect" || value === "circle" || value === "text" || value === "path" || value === "image") {
+    return value;
+  }
+  return "line";
 };
 
 const buildGraphicsMapByObjectKey = (graphics: Record<string, unknown>[]): Map<string, Record<string, unknown>> => {
@@ -1058,6 +1626,7 @@ const restoreSessionByVersion = async (
   userId: number,
   targetVersion: number
 ): Promise<SessionRestoreVersionVO> => {
+  // 版本恢复属于高风险写操作：仅管理员/房主可执行，且会话必须可编辑。
   const session = await findSessionBySessionKey(sessionKey);
   if (!session) {
     throw new OperationServiceError("SESSION_NOT_FOUND", "会话不存在");
@@ -1066,11 +1635,21 @@ const restoreSessionByVersion = async (
   if (!member || member.membership_status !== "active") {
     throw new OperationServiceError("SESSION_FORBIDDEN", "无会话访问权限");
   }
+  if (session.status !== 1) {
+    throw new OperationServiceError("SESSION_FORBIDDEN", "会话已结束，不能编辑画布");
+  }
+  if (session.is_paused === 1) {
+    throw new OperationServiceError("SESSION_FORBIDDEN", "画布已暂停编辑");
+  }
+  if (member.role < 2) {
+    throw new OperationServiceError("SESSION_FORBIDDEN", "仅管理员和房主可恢复历史版本");
+  }
   const previousVersion = toNumber(session.current_version);
   if (!Number.isInteger(targetVersion) || targetVersion < 0 || targetVersion > previousVersion) {
     throw new OperationServiceError("INVALID_ARGUMENT", "目标版本无效");
   }
 
+  // 回放 targetVersion 的结果即“目标画布状态”。
   const replay = await getSessionReplayByVersion(sessionKey, userId, targetVersion);
   const replayMap = new Map<string, Record<string, unknown>>();
   const baseGraphics = replay.baseSnapshotData?.graphics ?? [];
@@ -1087,9 +1666,10 @@ const restoreSessionByVersion = async (
       return;
     }
     const resolvedGraphic = getObjectValue(op.resolvedResult?.graphic);
-    const key = typeof resolvedGraphic.objectKey === "string" ? resolvedGraphic.objectKey : op.objectKey;
-    if (key) {
-      replayMap.set(key, resolvedGraphic);
+    const resolvedObjectKey = typeof resolvedGraphic.objectKey === "string" ? resolvedGraphic.objectKey : "";
+    // 仅当 resolved graphic 携带有效 objectKey 时才直接采用，避免把空对象写入回放状态。
+    if (resolvedObjectKey) {
+      replayMap.set(resolvedObjectKey, resolvedGraphic);
       return;
     }
     const patch = getObjectValue(op.operationData);
@@ -1113,14 +1693,24 @@ const restoreSessionByVersion = async (
   let updatedCount = 0;
   let deletedCount = 0;
 
-  const restoreClientId = `restore_${session.id}_${Date.now()}`;
+  // 恢复过程中产生一批系统操作，用 restore_* 元信息统一标识。
+  const restoreClientId = `restore_${session.id}_tv_${targetVersion}_${Date.now()}`;
   let lamport = Date.now();
+  let restoreOpSeq = 0;
   const bumpLamport = (): number => {
     lamport += 1;
     return lamport;
   };
+  const buildRestoreOperationId = (operationType: "create_graphic" | "update_graphic" | "delete_graphic"): string => {
+    const opCode = operationType === "create_graphic" ? "c" : operationType === "update_graphic" ? "u" : "d";
+    restoreOpSeq += 1;
+    const seq = restoreOpSeq.toString(36);
+    const compactRand = Math.random().toString(36).slice(2, 6);
+    // 控制在 64 字符以内，避免写 operations.operation_id(varchar(64)) 报错。
+    return `rs_${session.id}_${opCode}_${Date.now().toString(36)}_${seq}_${compactRand}`;
+  };
   const nextMeta = (operationType: "create_graphic" | "update_graphic" | "delete_graphic", objectKey: string) => ({
-    operationId: `${operationType}_${objectKey}_restore_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    operationId: buildRestoreOperationId(operationType),
     clientId: restoreClientId,
     baseVersion: previousVersion,
     lamportTime: bumpLamport()
@@ -1138,21 +1728,41 @@ const restoreSessionByVersion = async (
       continue;
     }
 
-    const currentSerialized = JSON.stringify(currentGraphic);
-    const targetSerialized = JSON.stringify(targetGraphic);
-    if (currentSerialized === targetSerialized) {
+    // 图元类型发生变化时不能仅做 patch 更新（patch 不包含 objectType），
+    // 需先删后建，确保真正恢复到目标版本的图元类型与结构。
+    const currentObjectType = normalizeObjectType(currentGraphic.objectType);
+    const targetObjectType = normalizeObjectType(targetGraphic.objectType);
+    if (currentObjectType !== targetObjectType) {
+      await deleteGraphic(session.id, userId, objectKey, nextMeta("delete_graphic", objectKey));
+      const recreateDTO = graphicToCreateDTO({ ...targetGraphic, objectKey });
+      if (recreateDTO) {
+        await createGraphic(session.id, userId, recreateDTO, nextMeta("create_graphic", objectKey));
+        createdCount += 1;
+      }
+      deletedCount += 1;
+      continue;
+    }
+
+    const currentComparable = toComparableGraphicState(currentGraphic);
+    const targetComparable = toComparableGraphicState(targetGraphic);
+    if (JSON.stringify(currentComparable) === JSON.stringify(targetComparable)) {
+      continue;
+    }
+    const nextPatch = graphicToUpdatePatch(targetGraphic);
+    if (Object.keys(nextPatch).length === 0) {
       continue;
     }
     await updateGraphic(
       session.id,
       userId,
       objectKey,
-      graphicToUpdatePatch(targetGraphic),
+      nextPatch as UpdateGraphicDTO,
       nextMeta("update_graphic", objectKey)
     );
     updatedCount += 1;
   }
 
+  // 当前存在但目标版本不存在的对象，需要补删以达成状态一致。
   for (const [objectKey] of currentMap) {
     if (targetMap.has(objectKey)) {
       continue;
@@ -1163,6 +1773,9 @@ const restoreSessionByVersion = async (
 
   const latestSession = await findSessionBySessionKey(sessionKey);
   const restoredVersion = latestSession ? toNumber(latestSession.current_version) : previousVersion;
+  await invalidateSessionGraphicsCache(session.id).catch(() => {
+    // ignore redis cache error
+  });
   return {
     sessionId: session.id,
     sessionKey: session.session_key,
@@ -1179,17 +1792,20 @@ type GraphicSnapshotRow = RowDataPacket & {
   id: number;
   session_id: number;
   object_key: string;
-  object_type: "line" | "rect" | "circle" | "text" | "path";
+  object_type: "line" | "rect" | "circle" | "text" | "path" | "image";
   position_x: number | string;
   position_y: number | string;
   width: number | string | null;
   height: number | string | null;
   stroke_color: string;
+  line_style: "solid" | "dashed";
   fill_color: string | null;
   stroke_width: number | string;
   text_content: string | null;
   font_size: number | null;
   path_points: string | null;
+  is_locked: number;
+  rotation: number | string;
   z_index: number;
   version: number | string;
   creator_id: number;
@@ -1198,28 +1814,33 @@ type GraphicSnapshotRow = RowDataPacket & {
 };
 
 const parsePathPoints = (value: unknown): Array<{ x: number; y: number }> | null => {
-  if (typeof value !== "string" || value.trim().length === 0) {
+  if (!value) {
     return null;
   }
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (!Array.isArray(parsed)) {
-      return null;
-    }
-    const points = parsed
+  if (Array.isArray(value)) {
+    const points = value
       .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
       .map((item) => ({ x: toNumber(item.x), y: toNumber(item.y) }))
       .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y));
     return points.length > 0 ? points : null;
-  } catch (_error) {
-    return null;
   }
+  if (typeof value === "string") {
+    if (value.trim().length === 0) {
+      return null;
+    }
+    try {
+      return parsePathPoints(JSON.parse(value));
+    } catch (_error) {
+      return null;
+    }
+  }
+  return null;
 };
 
 const findGraphicsBySessionId = async (sessionId: number): Promise<Record<string, unknown>[]> => {
   const [rows] = await dbPool.query<GraphicSnapshotRow[]>(
     `SELECT id, session_id, object_key, object_type, position_x, position_y, width, height,
-            stroke_color, fill_color, stroke_width, text_content, font_size, path_points, z_index,
+            stroke_color, line_style, fill_color, stroke_width, text_content, font_size, path_points, is_locked, rotation, z_index,
             version, creator_id, created_at, updated_at
      FROM graphic_objects
      WHERE session_id = ? AND is_deleted = 0
@@ -1236,11 +1857,14 @@ const findGraphicsBySessionId = async (sessionId: number): Promise<Record<string
     width: row.width === null ? null : toNumber(row.width),
     height: row.height === null ? null : toNumber(row.height),
     strokeColor: row.stroke_color,
+    lineStyle: row.line_style === "dashed" ? "dashed" : "solid",
     fillColor: row.fill_color,
     strokeWidth: toNumber(row.stroke_width),
     textContent: row.text_content,
     fontSize: row.font_size,
     pathPoints: parsePathPoints(row.path_points),
+    isLocked: row.is_locked === 1,
+    rotation: toNumber(row.rotation),
     zIndex: row.z_index,
     version: toNumber(row.version),
     creatorId: row.creator_id,

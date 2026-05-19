@@ -26,12 +26,14 @@ export const authMiddleware = async (req: Request, res: Response, next: NextFunc
   const token = extractBearerToken(req.headers.authorization);
 
   if (!token) {
+    // 2001：未携带有效登录凭证。
     send(res, { code: 2001, message: "未登录", data: null });
     return;
   }
 
   const userId = await verifyTokenAndGetUserId(token);
   if (!userId) {
+    // 2002：token 无效或过期。
     send(res, { code: 2002, message: "登录已过期", data: null });
     return;
   }

@@ -13,14 +13,20 @@ import {
   updateGraphicObjectById
 } from "../models/graphicModel";
 import { findSessionBySessionKey, findSessionMember } from "../models/sessionModel";
-import { CreateGraphicDTO, GraphicObjectType, GraphicVO, UpdateGraphicDTO } from "../types";
+import {
+  getSessionGraphicsCache,
+  invalidateSessionGraphicsCache,
+  setSessionGraphicsCache
+} from "./snapshotCacheService";
+import { CreateGraphicDTO, GraphicLineStyle, GraphicObjectType, GraphicVO, UpdateGraphicDTO } from "../types";
 
 type GraphicsResult = {
   graphics: GraphicVO[];
   currentVersion: number;
 };
 
-const GRAPHIC_TYPES: GraphicObjectType[] = ["line", "rect", "circle", "text", "path"];
+const GRAPHIC_TYPES: GraphicObjectType[] = ["line", "rect", "circle", "text", "path", "image"];
+const LINE_STYLES: GraphicLineStyle[] = ["solid", "dashed"];
 
 // 统一图形模块业务异常，controller 根据 code 映射 API 错误码。
 export class GraphicServiceError extends Error {
@@ -51,22 +57,27 @@ const toIsoString = (value: Date | string): string => {
 };
 
 const parsePathPoints = (value: unknown): Array<{ x: number; y: number }> | null => {
-  if (typeof value !== "string" || value.trim().length === 0) {
+  if (!value) {
     return null;
   }
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (!Array.isArray(parsed)) {
-      return null;
-    }
-    const points = parsed
+  if (Array.isArray(value)) {
+    const points = value
       .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
       .map((item) => ({ x: toNumber(item.x), y: toNumber(item.y) }))
       .filter((item) => Number.isFinite(item.x) && Number.isFinite(item.y));
     return points.length > 0 ? points : null;
-  } catch (_error) {
-    return null;
   }
+  if (typeof value === "string") {
+    if (value.trim().length === 0) {
+      return null;
+    }
+    try {
+      return parsePathPoints(JSON.parse(value));
+    } catch (_error) {
+      return null;
+    }
+  }
+  return null;
 };
 
 const toPathPointsJson = (points: Array<{ x: number; y: number }> | undefined): string | null => {
@@ -78,6 +89,7 @@ const toPathPointsJson = (points: Array<{ x: number; y: number }> | undefined): 
 
 // 数据库行到 VO 的统一映射，避免字段转换散落在业务流程中。
 const toGraphicVO = (row: GraphicRow): GraphicVO => {
+  const lineStyle = row.line_style === "dashed" ? "dashed" : "solid";
   return {
     id: row.id,
     sessionId: row.session_id,
@@ -88,11 +100,14 @@ const toGraphicVO = (row: GraphicRow): GraphicVO => {
     width: row.width === null ? null : toNumber(row.width),
     height: row.height === null ? null : toNumber(row.height),
     strokeColor: row.stroke_color,
+    lineStyle,
     fillColor: row.fill_color,
     strokeWidth: toNumber(row.stroke_width),
     textContent: row.text_content,
     fontSize: row.font_size,
     pathPoints: parsePathPoints(row.path_points),
+    isLocked: row.is_locked === 1,
+    rotation: toNumber(row.rotation),
     zIndex: row.z_index,
     version: toNumber(row.version),
     creatorId: row.creator_id,
@@ -147,6 +162,9 @@ const normalizeCreateGraphicData = (data: CreateGraphicDTO): CreateGraphicDTO =>
   assertFiniteNumber(data.positionX, "positionX");
   assertFiniteNumber(data.positionY, "positionY");
   assertString(data.strokeColor, "strokeColor");
+  if (typeof data.lineStyle !== "undefined" && !LINE_STYLES.includes(data.lineStyle)) {
+    throw new GraphicServiceError("INVALID_ARGUMENT", "lineStyle 参数错误");
+  }
   assertFiniteNumber(data.strokeWidth, "strokeWidth");
   assertFiniteNumber(data.zIndex, "zIndex");
 
@@ -182,6 +200,12 @@ const normalizeCreateGraphicData = (data: CreateGraphicDTO): CreateGraphicDTO =>
       }
     });
   }
+  if (typeof data.isLocked !== "undefined" && typeof data.isLocked !== "boolean") {
+    throw new GraphicServiceError("INVALID_ARGUMENT", "isLocked 参数错误");
+  }
+  if (typeof data.rotation !== "undefined") {
+    assertFiniteNumber(data.rotation, "rotation");
+  }
 
   return data;
 };
@@ -207,6 +231,9 @@ const normalizeUpdateGraphicData = (data: UpdateGraphicDTO): UpdateGraphicDTO =>
   }
   if (typeof data.strokeColor !== "undefined") {
     assertString(data.strokeColor, "strokeColor");
+  }
+  if (typeof data.lineStyle !== "undefined" && !LINE_STYLES.includes(data.lineStyle)) {
+    throw new GraphicServiceError("INVALID_ARGUMENT", "lineStyle 参数错误");
   }
   if (typeof data.fillColor !== "undefined") {
     assertString(data.fillColor, "fillColor");
@@ -240,6 +267,12 @@ const normalizeUpdateGraphicData = (data: UpdateGraphicDTO): UpdateGraphicDTO =>
       }
     });
   }
+  if (typeof data.isLocked !== "undefined" && typeof data.isLocked !== "boolean") {
+    throw new GraphicServiceError("INVALID_ARGUMENT", "isLocked 参数错误");
+  }
+  if (typeof data.rotation !== "undefined") {
+    assertFiniteNumber(data.rotation, "rotation");
+  }
 
   return data;
 };
@@ -272,11 +305,14 @@ const graphicServiceImpl: GraphicService = {
           width: typeof normalizedData.width === "number" ? normalizedData.width : null,
           height: typeof normalizedData.height === "number" ? normalizedData.height : null,
           strokeColor: normalizedData.strokeColor,
+          lineStyle: normalizedData.lineStyle === "dashed" ? "dashed" : "solid",
           fillColor: typeof normalizedData.fillColor === "string" ? normalizedData.fillColor : null,
           strokeWidth: normalizedData.strokeWidth,
           textContent: typeof normalizedData.textContent === "string" ? normalizedData.textContent : null,
           fontSize: typeof normalizedData.fontSize === "number" ? normalizedData.fontSize : null,
           pathPoints: toPathPointsJson(normalizedData.pathPoints),
+          isLocked: normalizedData.isLocked === true,
+          rotation: typeof normalizedData.rotation === "number" ? normalizedData.rotation : 0,
           zIndex: normalizedData.zIndex,
           version: nextVersion,
           creatorId: userId
@@ -290,6 +326,9 @@ const graphicServiceImpl: GraphicService = {
       if (!createdGraphic) {
         throw new GraphicServiceError("GRAPHIC_NOT_FOUND", "图形对象不存在");
       }
+      await invalidateSessionGraphicsCache(sessionId).catch(() => {
+        // ignore redis cache error
+      });
 
       return toGraphicVO(createdGraphic);
     } catch (error) {
@@ -325,6 +364,7 @@ const graphicServiceImpl: GraphicService = {
           width: typeof normalizedData.width === "number" ? normalizedData.width : undefined,
           height: typeof normalizedData.height === "number" ? normalizedData.height : undefined,
           strokeColor: normalizedData.strokeColor,
+          lineStyle: typeof normalizedData.lineStyle === "string" ? normalizedData.lineStyle : undefined,
           fillColor: typeof normalizedData.fillColor === "string" ? normalizedData.fillColor : undefined,
           strokeWidth: normalizedData.strokeWidth,
           textContent: typeof normalizedData.textContent === "string" ? normalizedData.textContent : undefined,
@@ -332,6 +372,8 @@ const graphicServiceImpl: GraphicService = {
           pathPoints: Array.isArray(normalizedData.pathPoints)
             ? JSON.stringify(normalizedData.pathPoints)
             : undefined,
+          isLocked: typeof normalizedData.isLocked === "boolean" ? normalizedData.isLocked : undefined,
+          rotation: typeof normalizedData.rotation === "number" ? normalizedData.rotation : undefined,
           zIndex: normalizedData.zIndex
         },
         nextVersion,
@@ -344,6 +386,9 @@ const graphicServiceImpl: GraphicService = {
       if (!updatedGraphic) {
         throw new GraphicServiceError("GRAPHIC_NOT_FOUND", "图形对象不存在");
       }
+      await invalidateSessionGraphicsCache(sessionId).catch(() => {
+        // ignore redis cache error
+      });
 
       return toGraphicVO(updatedGraphic);
     } catch (error) {
@@ -372,6 +417,9 @@ const graphicServiceImpl: GraphicService = {
       const nextVersion = await getNextVersion(sessionId, connection);
       await softDeleteGraphicById(targetGraphic.id, nextVersion, connection);
       await connection.commit();
+      await invalidateSessionGraphicsCache(sessionId).catch(() => {
+        // ignore redis cache error
+      });
     } catch (error) {
       await connection.rollback();
       throw error;
@@ -381,17 +429,33 @@ const graphicServiceImpl: GraphicService = {
   },
 
   async getGraphics(sessionId: number, sinceVersion?: number): Promise<GraphicsResult> {
+    if (typeof sinceVersion !== "number") {
+      const cached = await getSessionGraphicsCache(sessionId).catch(() => null);
+      if (cached) {
+        return {
+          currentVersion: cached.currentVersion,
+          graphics: cached.graphics as GraphicVO[]
+        };
+      }
+    }
+
     const currentVersion = await findSessionCurrentVersion(sessionId);
     if (currentVersion === null) {
       throw new GraphicServiceError("SESSION_NOT_FOUND", "会话不存在");
     }
 
     const graphicsRows = await findActiveGraphicsBySessionId(sessionId, sinceVersion);
-    return {
+    const result = {
       currentVersion,
       // 仅返回 is_deleted=0 的对象；增量由 model 层按 version 过滤。
       graphics: graphicsRows.map(toGraphicVO)
     };
+    if (typeof sinceVersion !== "number") {
+      await setSessionGraphicsCache(sessionId, result).catch(() => {
+        // ignore redis cache error
+      });
+    }
+    return result;
   }
 };
 

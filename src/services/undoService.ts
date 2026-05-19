@@ -73,6 +73,7 @@ const toNumber = (value: unknown, fallback = 0): number => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+// 用于生成兜底 operationId，避免 undo/redo 在缺少前端元信息时写库失败。
 const randomOpSuffix = (): string => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
 const normalizeUndoRedoMeta = (
@@ -81,6 +82,8 @@ const normalizeUndoRedoMeta = (
   fallbackBaseVersion: number,
   raw?: UndoRedoMeta
 ): NormalizedUndoRedoMeta => {
+  // operationId/clientId/baseVersion/lamportTime 四元组统一在服务层补全，
+  // 这样不管是 HTTP 还是 WS 入口都能复用同一套撤销重做逻辑。
   const operationId = typeof raw?.operationId === "string" && raw.operationId.trim().length > 0
     ? raw.operationId.trim()
     : `${kind}_${fallbackOperationId}_${randomOpSuffix()}`;
@@ -136,6 +139,14 @@ const toGraphicVOFromUnknown = (value: unknown): GraphicVO | null => {
   }
   const objectKey = typeof value.objectKey === "string" ? value.objectKey : "";
   const objectType = typeof value.objectType === "string" ? value.objectType : "line";
+  const normalizedObjectType = (
+    objectType === "line" ||
+    objectType === "rect" ||
+    objectType === "circle" ||
+    objectType === "text" ||
+    objectType === "path" ||
+    objectType === "image"
+  ) ? objectType : "line";
   if (!objectKey) {
     return null;
   }
@@ -143,17 +154,20 @@ const toGraphicVOFromUnknown = (value: unknown): GraphicVO | null => {
     id: toNumber(value.id),
     sessionId: toNumber(value.sessionId),
     objectKey,
-    objectType: (objectType as GraphicVO["objectType"]) || "line",
+    objectType: normalizedObjectType as GraphicVO["objectType"],
     positionX: toNumber(value.positionX),
     positionY: toNumber(value.positionY),
     width: typeof value.width === "number" ? value.width : null,
     height: typeof value.height === "number" ? value.height : null,
     strokeColor: typeof value.strokeColor === "string" ? value.strokeColor : "#000000",
+    lineStyle: value.lineStyle === "dashed" ? "dashed" : "solid",
     fillColor: typeof value.fillColor === "string" ? value.fillColor : null,
     strokeWidth: toNumber(value.strokeWidth, 1),
     textContent: typeof value.textContent === "string" ? value.textContent : null,
     fontSize: typeof value.fontSize === "number" ? value.fontSize : null,
     pathPoints: toPathPoints(value.pathPoints) ?? null,
+    isLocked: value.isLocked === true || value.isLocked === 1,
+    rotation: toNumber(value.rotation),
     zIndex: toNumber(value.zIndex),
     version: toNumber(value.version),
     creatorId: toNumber(value.creatorId),
@@ -162,14 +176,32 @@ const toGraphicVOFromUnknown = (value: unknown): GraphicVO | null => {
   };
 };
 
+// 撤销/重做属于“写操作”，沿用和实时编辑一致的会话状态校验，防止越权改画布。
 const ensureSessionAndMember = async (sessionId: number, userId: number): Promise<void> => {
   const currentVersion = await findSessionCurrentVersion(sessionId);
   if (currentVersion === null) {
     throw new UndoServiceError("SESSION_NOT_FOUND", "会话不存在");
   }
+  const [sessionRows] = await dbPool.query<Array<{ id: number; status: number; is_paused: number } & RowDataPacket>>(
+    "SELECT id, status, is_paused FROM sessions WHERE id = ? LIMIT 1",
+    [sessionId]
+  );
+  const session = sessionRows[0];
+  if (!session) {
+    throw new UndoServiceError("SESSION_NOT_FOUND", "会话不存在");
+  }
   const member = await findSessionMember(sessionId, userId);
   if (!member || member.membership_status !== "active") {
     throw new UndoServiceError("SESSION_FORBIDDEN", "无会话访问权限");
+  }
+  if (session.status !== 1) {
+    throw new UndoServiceError("SESSION_FORBIDDEN", "会话已结束，不能编辑画布");
+  }
+  if (session.is_paused === 1) {
+    throw new UndoServiceError("SESSION_FORBIDDEN", "画布已暂停编辑");
+  }
+  if (member.role === 0) {
+    throw new UndoServiceError("SESSION_FORBIDDEN", "只读成员无编辑权限");
   }
 };
 
@@ -180,6 +212,7 @@ const findHistoryByKind = async (
   kind: HistoryLookupKind
 ): Promise<HistoryOperationRow | null> => {
   const stateField = kind === "undo" ? "can_undo" : "can_redo";
+  // FOR UPDATE 锁住候选历史记录，避免并发点击撤销/重做时拿到同一条记录重复执行。
   const [rows] = await connection.query<HistoryOperationRow[]>(
     `SELECT h.id AS history_id, h.operation_id AS operation_record_id,
             o.operation_id, o.session_id, o.user_id, o.object_key, o.operation_type, o.operation_data,
@@ -247,11 +280,14 @@ const toUpdatePatchFromGraphic = (graphic: GraphicVO): Record<string, unknown> =
   width: graphic.width ?? undefined,
   height: graphic.height ?? undefined,
   strokeColor: graphic.strokeColor,
+  lineStyle: graphic.lineStyle,
   fillColor: graphic.fillColor ?? undefined,
   strokeWidth: graphic.strokeWidth,
   textContent: graphic.textContent ?? undefined,
   fontSize: graphic.fontSize ?? undefined,
   pathPoints: graphic.pathPoints ?? undefined,
+  isLocked: graphic.isLocked,
+  rotation: graphic.rotation,
   zIndex: graphic.zIndex
 });
 
@@ -261,6 +297,7 @@ const markUndoHistoryDone = async (
   historyId: number,
   inverseOperationRecordId: number
 ): Promise<void> => {
+  // undo 成功后把“可撤销”切到“可重做”，并记录本次逆向操作，形成闭环。
   await dbPool.execute(
     "UPDATE user_operation_history SET can_undo = 0, can_redo = 1, undo_operation_id = ? WHERE id = ? AND user_id = ? AND session_id = ?",
     [inverseOperationRecordId, historyId, userId, sessionId]
@@ -272,6 +309,7 @@ const markRedoHistoryDone = async (
   sessionId: number,
   historyId: number
 ): Promise<void> => {
+  // redo 成功后回到可撤销状态，和普通编辑后的历史状态保持一致。
   await dbPool.execute(
     "UPDATE user_operation_history SET can_undo = 1, can_redo = 0 WHERE id = ? AND user_id = ? AND session_id = ?",
     [historyId, userId, sessionId]
@@ -296,6 +334,7 @@ const applyUndoByHistory = async (
   userId: number,
   normalizedMeta: NormalizedUndoRedoMeta
 ): Promise<UndoRedoResult> => {
+  // resolved_result 里保存了操作时的图形快照，撤销时优先用它恢复“当时状态”。
   const resolved = toResolvedResult(history.resolved_result);
   const currentGraphic = toGraphicVOFromUnknown(resolved.graphic);
   const beforeGraphic = toGraphicVOFromUnknown(resolved.beforeGraphic);
@@ -306,6 +345,7 @@ const applyUndoByHistory = async (
     if (!currentGraphic) {
       throw new UndoServiceError("BROKEN_OPERATION_DATA", "创建操作缺少当前图形快照");
     }
+    // 撤销创建 = 删除该对象。
     const result = await operationService.deleteGraphic(
       history.session_id,
       userId,
@@ -338,6 +378,7 @@ const applyUndoByHistory = async (
     if (!deletedGraphic) {
       throw new UndoServiceError("BROKEN_OPERATION_DATA", "删除操作缺少已删图形快照");
     }
+    // 撤销删除 = 按删除前快照重建对象。
     const result = await operationService.createGraphic(
       history.session_id,
       userId,
@@ -349,6 +390,7 @@ const applyUndoByHistory = async (
         width: deletedGraphic.width ?? undefined,
         height: deletedGraphic.height ?? undefined,
         strokeColor: deletedGraphic.strokeColor,
+        lineStyle: deletedGraphic.lineStyle,
         fillColor: deletedGraphic.fillColor ?? undefined,
         strokeWidth: deletedGraphic.strokeWidth,
         textContent: deletedGraphic.textContent ?? undefined,
@@ -383,6 +425,7 @@ const applyUndoByHistory = async (
   if (!beforeGraphic) {
     throw new UndoServiceError("BROKEN_OPERATION_DATA", "更新操作缺少变更前图形");
   }
+  // 撤销更新 = 回写 beforeGraphic 里的完整字段。
   const result = await operationService.updateGraphic(
     history.session_id,
     userId,
@@ -417,6 +460,7 @@ const applyRedoByHistory = async (
   userId: number,
   normalizedMeta: NormalizedUndoRedoMeta
 ): Promise<UndoRedoResult> => {
+  // redo 直接复用原始 operation_data，保证和第一次执行的输入一致。
   const operationData = toObject(history.operation_data);
   const objectKey = history.object_key;
 
@@ -433,6 +477,7 @@ const applyRedoByHistory = async (
         width: typeof payload.width === "number" ? payload.width : undefined,
         height: typeof payload.height === "number" ? payload.height : undefined,
         strokeColor: typeof payload.strokeColor === "string" ? payload.strokeColor : "#000000",
+        lineStyle: payload.lineStyle === "dashed" ? "dashed" : "solid",
         fillColor: typeof payload.fillColor === "string" ? payload.fillColor : undefined,
         strokeWidth: toNumber(payload.strokeWidth, 1),
         textContent: typeof payload.textContent === "string" ? payload.textContent : undefined,
@@ -529,6 +574,7 @@ const undoImpl = async (sessionId: number, userId: number, meta?: UndoRedoMeta):
   const normalizedMeta = normalizeUndoRedoMeta("undo", fallbackOperationId, toNumber(history.server_version), meta);
   try {
     const result = await applyUndoByHistory(history, userId, normalizedMeta);
+    // 只在真正执行成功后切换历史状态，避免异常时丢失可恢复链路。
     await markUndoHistoryDone(userId, sessionId, history.history_id, result.operation?.operationId ?? 0);
     return result;
   } catch (error) {

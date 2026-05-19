@@ -12,8 +12,10 @@ router.get("/health", (_req, res) => {
   res.status(200).json({ code: 0, message: "OK", data: null });
 });
 
+// 兼容单复数两种用户路由前缀，避免前端历史版本调用失败。
 router.use("/v1/user", userRouter);
 router.use("/v1/users", userRouter);
+// graphics 嵌套路由依赖上层 :sessionKey 参数（mergeParams=true）。
 router.use("/v1/sessions/:sessionKey/graphics", graphicRouter);
 router.use("/v1/sessions", sessionRouter);
 

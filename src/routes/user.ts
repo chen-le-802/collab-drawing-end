@@ -2,13 +2,25 @@ import { Router } from "express";
 import { getMe, getProfile, login, logout, postChangePassword, putProfile, register, uploadAvatar } from "../controllers/userController";
 import { authMiddleware } from "../middleware/auth";
 import { avatarUploadMiddleware } from "../middleware/avatarUpload";
+import { byIp, createRateLimitMiddleware } from "../middleware/rateLimit";
+import { env } from "../config/env";
 
 const router = Router();
 
 // 用户注册
 router.post("/register", register);
 // 用户登录
-router.post("/login", login);
+router.post(
+  "/login",
+  createRateLimitMiddleware({
+    keyPrefix: "login",
+    windowSeconds: env.loginRateLimitWindowSeconds,
+    maxRequests: env.loginRateLimitMax,
+    getScopeKey: byIp,
+    errorMessage: "登录过于频繁，请稍后再试"
+  }),
+  login
+);
 // 获取当前登录用户信息（需鉴权）
 router.get("/me", authMiddleware, getMe);
 // 获取个人中心信息（需鉴权）

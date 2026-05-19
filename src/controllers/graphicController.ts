@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 
 import { getSessionGraphicsBySessionKey, GraphicServiceError } from "../services/graphicService";
+import { emitAlert } from "../services/alertService";
 import { ApiResponse } from "../types";
 
 type AuthRequest = Request & {
@@ -53,6 +54,14 @@ const mapServiceError = (res: Response, error: unknown): void => {
   }
 
   send(res, { code: 4001, message: "服务器错误", data: null });
+  emitAlert({
+    key: "api.error.4001.graphic",
+    level: "error",
+    message: "GraphicController 返回 4001",
+    detail: {
+      error: error instanceof Error ? error.message : String(error)
+    }
+  });
 };
 
 export const getSessionGraphics = async (req: Request, res: Response): Promise<void> => {

@@ -6,9 +6,9 @@ import multer from "multer";
 import { env } from "../config/env";
 import { ApiResponse, AuthPayload } from "../types";
 
-const AVATAR_MAX_SIZE = Math.max(1, Math.floor(env.avatarMaxSizeMb)) * 1024 * 1024;
+const SESSION_IMAGE_MAX_SIZE = Math.max(1, Math.floor(env.sessionImageMaxSizeMb)) * 1024 * 1024;
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
-const uploadDir = path.resolve(process.cwd(), "uploads", "avatars");
+const uploadDir = path.resolve(process.cwd(), "uploads", "session-images");
 
 const send = <T>(res: Response, payload: ApiResponse<T>): Response => {
   return res.status(200).json(payload);
@@ -29,23 +29,23 @@ const storage = multer.diskStorage({
     const authReq = req as Request & { user?: AuthPayload };
     const userId = authReq.user?.userId ?? 0;
     const ext = path.extname(file.originalname) || ".jpg";
-    cb(null, `avatar_${userId}_${Date.now()}${ext.toLowerCase()}`);
+    cb(null, `session_image_${userId}_${Date.now()}${ext.toLowerCase()}`);
   }
 });
 
 const upload = multer({
   storage,
-  limits: { fileSize: AVATAR_MAX_SIZE },
+  limits: { fileSize: SESSION_IMAGE_MAX_SIZE },
   fileFilter: (_req, file, cb) => {
     if (!ALLOWED_IMAGE_MIME_TYPES.has(file.mimetype)) {
-      cb(new Error("仅支持 JPG/JPEG、PNG、WEBP 格式头像"));
+      cb(new Error("仅支持 JPG/JPEG、PNG、WEBP 格式图片"));
       return;
     }
     cb(null, true);
   }
 });
 
-export const avatarUploadMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+export const sessionImageUploadMiddleware = (req: Request, res: Response, next: NextFunction): void => {
   upload.single("file")(req, res, (error: unknown) => {
     if (!error) {
       next();
@@ -53,10 +53,10 @@ export const avatarUploadMiddleware = (req: Request, res: Response, next: NextFu
     }
 
     if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
-      send(res, { code: 1001, message: `头像图片大小不能超过 ${Math.max(1, Math.floor(env.avatarMaxSizeMb))}MB`, data: null });
+      send(res, { code: 1001, message: `图片大小不能超过 ${Math.max(1, Math.floor(env.sessionImageMaxSizeMb))}MB`, data: null });
       return;
     }
 
-    send(res, { code: 1001, message: error instanceof Error ? error.message : "头像上传失败", data: null });
+    send(res, { code: 1001, message: error instanceof Error ? error.message : "图片上传失败", data: null });
   });
 };

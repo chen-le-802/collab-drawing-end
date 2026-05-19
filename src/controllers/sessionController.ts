@@ -1,8 +1,14 @@
 import { Request, Response } from "express";
+import { findUserById } from "../models/userModel";
+import { broadcastSessionMemberStatusChangedEvent, broadcastSessionPausedEvent } from "../ws/server";
 
 import { ApiResponse } from "../types";
 import {
+  createSessionInviteForOperator,
+  getSessionInviteListForOperator,
+  revokeSessionInviteForOperator,
   createSessionForUser,
+  closeSessionForOwner,
   deleteSessionForUser,
   getSessionDetailForUser,
   getUserSessionList,
@@ -10,10 +16,13 @@ import {
   joinSessionForUser,
   leaveSessionForUser,
   removeSessionMemberForCreator,
-  transferSessionCreatorForUser,
+  setSessionPausedForOperator,
+  setSessionMemberRoleForOperator,
+  uploadSessionImageForOperator,
   SessionServiceError
 } from "../services/sessionService";
 import { operationService, OperationServiceError } from "../services/operationService";
+import { emitAlert } from "../services/alertService";
 
 type AuthRequest = Request & {
   user?: {
@@ -64,6 +73,78 @@ const parsePathPositiveInteger = (value: unknown): number | null => {
   return parsed;
 };
 
+// 成员角色变更仅允许 0/1/2（viewer/editor/manager），owner 不走此入口变更。
+const parseSessionMemberRole = (value: unknown): number | null => {
+  const normalized = typeof value === "object" && value !== null && "role" in value
+    ? (value as { role?: unknown }).role
+    : value;
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed)) {
+    return null;
+  }
+  if (parsed !== 0 && parsed !== 1 && parsed !== 2) {
+    return null;
+  }
+  return parsed;
+};
+
+// 邀请角色同样限制在 0/1/2，避免直接邀请为 owner。
+const parseSessionInviteRole = (value: unknown): number | null => {
+  const normalized = typeof value === "object" && value !== null && "role" in value
+    ? (value as { role?: unknown }).role
+    : value;
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed)) {
+    return null;
+  }
+  if (parsed !== 0 && parsed !== 1 && parsed !== 2) {
+    return null;
+  }
+  return parsed;
+};
+
+const parseSessionInviteMaxUses = (value: unknown): number | null => {
+  const normalized = typeof value === "object" && value !== null && "maxUses" in value
+    ? (value as { maxUses?: unknown }).maxUses
+    : value;
+  if (typeof normalized === "undefined") {
+    return null;
+  }
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+};
+
+const parseSessionInviteExpiresInHours = (value: unknown): number | null => {
+  const normalized = typeof value === "object" && value !== null && "expiresInHours" in value
+    ? (value as { expiresInHours?: unknown }).expiresInHours
+    : value;
+  if (typeof normalized === "undefined") {
+    return null;
+  }
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+};
+
+const parseSessionInviteToken = (value: unknown): string | null => {
+  const normalized = typeof value === "object" && value !== null && "inviteToken" in value
+    ? (value as { inviteToken?: unknown }).inviteToken
+    : value;
+  if (typeof normalized !== "string") {
+    return null;
+  }
+  const token = normalized.trim();
+  if (!token) {
+    return null;
+  }
+  return token;
+};
+
 // status 仅允许 0/1，避免把其他字符串误转换为数字后进入 SQL。
 const parseStatus = (value: unknown): number | null => {
   if (typeof value === "undefined") {
@@ -88,6 +169,40 @@ const parseBooleanFlag = (value: unknown): boolean | null => {
     return false;
   }
   return null;
+};
+
+const parseSessionPauseFlag = (value: unknown): boolean | null => {
+  const normalized = typeof value === "object" && value !== null && "isPaused" in value
+    ? (value as { isPaused?: unknown }).isPaused
+    : value;
+  if (normalized === true || normalized === "true" || normalized === 1 || normalized === "1") {
+    return true;
+  }
+  if (normalized === false || normalized === "false" || normalized === 0 || normalized === "0") {
+    return false;
+  }
+  return null;
+};
+
+// 快照名为空时交由 service 自动生成默认名；超长在 controller 先拦截。
+const parseSnapshotName = (value: unknown): string | null => {
+  const normalized = typeof value === "object" && value !== null && "snapshotName" in value
+    ? (value as { snapshotName?: unknown }).snapshotName
+    : value;
+  if (typeof normalized === "undefined" || normalized === null) {
+    return "";
+  }
+  if (typeof normalized !== "string") {
+    return null;
+  }
+  const name = normalized.trim();
+  if (!name) {
+    return "";
+  }
+  if (name.length > 40) {
+    return null;
+  }
+  return name;
 };
 
 const parseNonNegativeInteger = (value: unknown): number | null => {
@@ -124,6 +239,10 @@ const mapServiceError = (res: Response, error: unknown): void => {
   }
 
   if (error instanceof SessionServiceError) {
+    if (error.code === "INVALID_ARGUMENT") {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
     if (error.code === "SESSION_NOT_FOUND") {
       send(res, { code: 3001, message: "会话不存在", data: null });
       return;
@@ -132,9 +251,21 @@ const mapServiceError = (res: Response, error: unknown): void => {
       send(res, { code: 2003, message: "无会话访问权限", data: null });
       return;
     }
+    if (error.code === "SESSION_INVITE_REQUIRED" || error.code === "SESSION_INVITE_INVALID") {
+      send(res, { code: 2003, message: error.message, data: null });
+      return;
+    }
   }
 
   send(res, { code: 4001, message: "服务器错误", data: null });
+  emitAlert({
+    key: "api.error.4001.session",
+    level: "error",
+    message: "SessionController 返回 4001",
+    detail: {
+      error: error instanceof Error ? error.message : String(error)
+    }
+  });
 };
 
 export const getSessionOperations = async (req: Request, res: Response): Promise<void> => {
@@ -165,12 +296,12 @@ export const getSessionOperations = async (req: Request, res: Response): Promise
   }
 };
 
-const parseOperationType = (value: unknown): "create" | "update" | "delete" | null => {
+const parseOperationType = (value: unknown): "create" | "update" | "delete" | "restore" | null => {
   if (typeof value === "undefined") {
     return null;
   }
   const normalized = Array.isArray(value) ? value[0] : value;
-  if (normalized === "create" || normalized === "update" || normalized === "delete") {
+  if (normalized === "create" || normalized === "update" || normalized === "delete" || normalized === "restore") {
     return normalized;
   }
   return null;
@@ -313,8 +444,13 @@ export const createSessionSnapshot = async (req: Request, res: Response): Promis
       send(res, { code: 1001, message: "参数错误", data: null });
       return;
     }
+    const snapshotName = parseSnapshotName(req.body as { snapshotName?: unknown });
+    if (snapshotName === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
 
-    const result = await operationService.createSessionSnapshotBySessionKey(sessionKey, userId);
+    const result = await operationService.createSessionSnapshotBySessionKey(sessionKey, userId, snapshotName || undefined);
     send(res, { code: 0, message: "创建成功", data: result });
   } catch (error) {
     mapServiceError(res, error);
@@ -392,6 +528,7 @@ export const restoreSessionVersion = async (req: Request, res: Response): Promis
       return;
     }
 
+    // 恢复历史版本是“写操作”，由 service 内部继续做角色与会话状态校验。
     const result = await operationService.restoreSessionByVersion(sessionKey, userId, targetVersion);
     send(res, { code: 0, message: "恢复成功", data: result });
   } catch (error) {
@@ -517,9 +654,131 @@ export const joinSession = async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
+    const inviteToken = parseSessionInviteToken(req.body as { inviteToken?: unknown }) ?? undefined;
     // join 为幂等操作：重复加入同一会话也返回成功。
-    const result = await joinSessionForUser(sessionKey, userId);
+    const result = await joinSessionForUser(sessionKey, userId, inviteToken);
     send(res, { code: 0, message: "加入成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const createSessionInvite = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    const role = parseSessionInviteRole(req.body as { role?: unknown });
+    const maxUses = parseSessionInviteMaxUses(req.body as { maxUses?: unknown });
+    const expiresInHours = parseSessionInviteExpiresInHours(req.body as { expiresInHours?: unknown });
+    if (!sessionKey || role === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof (req.body as { maxUses?: unknown })?.maxUses !== "undefined" && maxUses === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof (req.body as { expiresInHours?: unknown })?.expiresInHours !== "undefined" && expiresInHours === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await createSessionInviteForOperator(sessionKey, userId, role, {
+      ...(typeof maxUses === "number" ? { maxUses } : {}),
+      ...(typeof expiresInHours === "number" ? { expiresInHours } : {})
+    });
+    send(res, { code: 0, message: "邀请创建成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const getSessionInviteList = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+    const sessionKey = getValidatedSessionKey(req);
+    const includeUsed = parseBooleanFlag(req.query.includeUsed);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+    if (typeof req.query.includeUsed !== "undefined" && includeUsed === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await getSessionInviteListForOperator(sessionKey, userId, {
+      includeUsed: includeUsed ?? false
+    });
+    send(res, { code: 0, message: "获取成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const revokeSessionInvite = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+    const sessionKey = getValidatedSessionKey(req);
+    const inviteId = parsePathPositiveInteger(req.params.inviteId);
+    if (!sessionKey || inviteId === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    await revokeSessionInviteForOperator(sessionKey, userId, inviteId);
+    send(res, { code: 0, message: "作废成功", data: null });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const uploadSessionImage = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const file = (req as Request & { file?: Express.Multer.File }).file;
+    if (!file?.filename) {
+      send(res, { code: 1001, message: "图片文件不能为空", data: null });
+      return;
+    }
+
+    const result = await uploadSessionImageForOperator(sessionKey, userId);
+    send(res, {
+      code: 0,
+      message: "上传成功",
+      data: {
+        ...result,
+        url: `/uploads/session-images/${file.filename}`
+      }
+    });
   } catch (error) {
     mapServiceError(res, error);
   }
@@ -571,7 +830,7 @@ export const removeSessionMember = async (req: Request, res: Response): Promise<
   }
 };
 
-export const transferSessionCreator = async (req: Request, res: Response): Promise<void> => {
+export const updateSessionMemberRole = async (req: Request, res: Response): Promise<void> => {
   try {
     const authReq = req as AuthRequest;
     const userId = authReq.user?.userId;
@@ -582,13 +841,61 @@ export const transferSessionCreator = async (req: Request, res: Response): Promi
 
     const sessionKey = getValidatedSessionKey(req);
     const targetUserId = parsePathPositiveInteger(req.params.userId);
-    if (!sessionKey || targetUserId === null) {
+    const role = parseSessionMemberRole(req.body as { role?: unknown });
+    if (!sessionKey || targetUserId === null || role === null) {
       send(res, { code: 1001, message: "参数错误", data: null });
       return;
     }
 
-    await transferSessionCreatorForUser(sessionKey, userId, targetUserId);
-    send(res, { code: 0, message: "转让成功", data: null });
+    await setSessionMemberRoleForOperator(sessionKey, userId, targetUserId, role);
+    send(res, { code: 0, message: "角色更新成功", data: null });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const updateSessionPausedStatus = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    const isPaused = parseSessionPauseFlag(req.body as { isPaused?: unknown });
+    if (!sessionKey || isPaused === null) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await setSessionPausedForOperator(sessionKey, userId, isPaused);
+    // 暂停状态变化后广播给在线成员，前端统一刷新编辑态。
+    await broadcastSessionPausedEvent(sessionKey, userId);
+    send(res, { code: 0, message: "更新成功", data: result });
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+};
+
+export const closeSession = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      send(res, { code: 2001, message: "未登录", data: null });
+      return;
+    }
+
+    const sessionKey = getValidatedSessionKey(req);
+    if (!sessionKey) {
+      send(res, { code: 1001, message: "参数错误", data: null });
+      return;
+    }
+
+    const result = await closeSessionForOwner(sessionKey, userId);
+    send(res, { code: 0, message: "结束成功", data: result });
   } catch (error) {
     mapServiceError(res, error);
   }
@@ -610,6 +917,13 @@ export const heartbeatSession = async (req: Request, res: Response): Promise<voi
     }
 
     await heartbeatSessionForUser(sessionKey, userId);
+    const user = await findUserById(userId);
+    // 心跳成功后主动广播在线态，避免前端必须刷新才能看到在线恢复。
+    broadcastSessionMemberStatusChangedEvent(sessionKey, {
+      userId,
+      username: user?.username ?? "",
+      onlineStatus: 1
+    });
     send(res, { code: 0, message: "心跳成功", data: null });
   } catch (error) {
     mapServiceError(res, error);
