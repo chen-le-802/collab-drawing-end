@@ -28,6 +28,10 @@ export type OperationRow = RowDataPacket & {
   server_version: number | string | null;
   lamport_time: number | string;
   client_id: string | null;
+  batch_id: string | null;
+  batch_index: number | string | null;
+  batch_size: number | string | null;
+  batch_label: string | null;
   resolved_result: unknown;
   conflict_type: ConflictType;
   timestamp: number;
@@ -94,7 +98,9 @@ export const findOperationsBySessionSinceVersion = async (
   // 增量同步按 server_version 升序返回，前端可直接顺序回放。
   const [rows] = await dbPool.query<OperationRow[]>(
     `SELECT id, version, operation_id, session_id, user_id, object_key, operation_type, operation_data,
-            base_version, server_version, lamport_time, client_id, resolved_result, conflict_type, timestamp
+            base_version, server_version, lamport_time, client_id,
+            batch_id, batch_index, batch_size, batch_label,
+            resolved_result, conflict_type, timestamp
      FROM operations
      WHERE session_id = ? AND server_version > ?
      ORDER BY server_version ASC, id ASC
@@ -114,7 +120,9 @@ export const findOperationsBySessionVersionRange = async (
   // 版本回放场景允许更大 limit，但仍设置硬上限防止单次拉取过大。
   const [rows] = await dbPool.query<OperationRow[]>(
     `SELECT id, version, operation_id, session_id, user_id, object_key, operation_type, operation_data,
-            base_version, server_version, lamport_time, client_id, resolved_result, conflict_type, timestamp
+            base_version, server_version, lamport_time, client_id,
+            batch_id, batch_index, batch_size, batch_label,
+            resolved_result, conflict_type, timestamp
      FROM operations
      WHERE session_id = ? AND server_version > ? AND server_version <= ?
      ORDER BY server_version ASC, id ASC
@@ -140,7 +148,9 @@ export const findOperationsByTimelineQuery = async (query: OperationTimelineQuer
   // 时间线列表按最新版本倒序展示，符合“最近操作优先看”的产品习惯。
   const [rows] = await dbPool.query<OperationRow[]>(
     `SELECT id, version, operation_id, session_id, user_id, object_key, operation_type, operation_data,
-            base_version, server_version, lamport_time, client_id, resolved_result, conflict_type, timestamp
+            base_version, server_version, lamport_time, client_id,
+            batch_id, batch_index, batch_size, batch_label,
+            resolved_result, conflict_type, timestamp
      FROM operations
      WHERE ${where}
      ORDER BY server_version DESC, id DESC
@@ -161,6 +171,10 @@ export type InsertOperationInput = {
   serverVersion: number;
   lamportTime: number;
   clientId: string;
+  batchId?: string;
+  batchIndex?: number;
+  batchSize?: number;
+  batchLabel?: string;
   resolvedResult: Record<string, unknown>;
   conflictType: ConflictType;
 };
@@ -173,7 +187,9 @@ export const findOperationByOperationId = async (
   const executor = getExecutor(connection);
   const [rows] = await executor.query<OperationRow[]>(
     `SELECT id, version, operation_id, session_id, user_id, object_key, operation_type, operation_data,
-            base_version, server_version, lamport_time, client_id, resolved_result, conflict_type, timestamp
+            base_version, server_version, lamport_time, client_id,
+            batch_id, batch_index, batch_size, batch_label,
+            resolved_result, conflict_type, timestamp
      FROM operations
      WHERE session_id = ? AND operation_id = ?
      LIMIT 1`,
@@ -187,30 +203,38 @@ export const insertOperationRecord = async (
   connection?: PoolConnection
 ): Promise<number> => {
   const executor = getExecutor(connection);
+  const operationDataJson = JSON.stringify(input.operationData) ?? "{}";
+  const resolvedResultJson = JSON.stringify(input.resolvedResult) ?? "{}";
+  const params: Array<string | number | null> = [
+    input.operationId,
+    input.sessionId,
+    input.userId,
+    input.objectKey,
+    input.operationType,
+    operationDataJson,
+    input.baseVersion,
+    input.serverVersion,
+    input.serverVersion,
+    input.lamportTime,
+    input.clientId,
+    input.batchId ?? null,
+    Number.isInteger(input.batchIndex) ? Number(input.batchIndex) : null,
+    Number.isInteger(input.batchSize) ? Number(input.batchSize) : null,
+    typeof input.batchLabel === "string" && input.batchLabel.trim().length > 0 ? input.batchLabel.trim() : null,
+    resolvedResultJson,
+    input.conflictType,
+    Date.now()
+  ];
   // version 与 server_version 同步写入，兼容历史查询逻辑。
-  const [result] = await executor.execute<ResultSetHeader>(
+  const [result] = await executor.execute(
     `INSERT INTO operations (
       operation_id, session_id, user_id, object_key, operation_type, operation_data,
       base_version, server_version, version, lamport_time, client_id,
+      batch_id, batch_index, batch_size, batch_label,
       resolved_result, conflict_type, resolved_at, timestamp, undoable, redoable
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, 1, 0)`,
-    [
-      input.operationId,
-      input.sessionId,
-      input.userId,
-      input.objectKey,
-      input.operationType,
-      JSON.stringify(input.operationData),
-      input.baseVersion,
-      input.serverVersion,
-      input.serverVersion,
-      input.lamportTime,
-      input.clientId,
-      JSON.stringify(input.resolvedResult),
-      input.conflictType,
-      Date.now()
-    ]
-  );
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, 1, 0)`,
+    params
+  ) as [ResultSetHeader, unknown];
   return result.insertId;
 };
 

@@ -58,6 +58,21 @@ type OperationMeta = {
   baseVersion?: number;
   lamportTime?: number;
   clientId?: string;
+  batchId?: string;
+  batchIndex?: number;
+  batchSize?: number;
+  batchLabel?: string;
+};
+
+type NormalizedOperationMeta = {
+  operationId: string;
+  baseVersion: number;
+  lamportTime: number;
+  clientId: string;
+  batchId?: string;
+  batchIndex?: number;
+  batchSize?: number;
+  batchLabel?: string;
 };
 
 type OperationResolved = {
@@ -249,7 +264,7 @@ const normalizeMeta = (
   operationType: "create_graphic" | "update_graphic" | "delete_graphic",
   objectKey: string,
   raw?: OperationMeta
-): Required<OperationMeta> & { operationId: string } => {
+): NormalizedOperationMeta => {
   // 统一补齐协同元信息，兼容旧客户端缺字段的情况。
   const operationId = typeof raw?.operationId === "string" && raw.operationId.trim().length > 0
     ? raw.operationId.trim()
@@ -263,7 +278,19 @@ const normalizeMeta = (
   const clientId = typeof raw?.clientId === "string" && raw.clientId.trim().length > 0
     ? raw.clientId.trim()
     : "legacy_client";
-  return { operationId, baseVersion, lamportTime, clientId };
+  const batchId = typeof raw?.batchId === "string" && raw.batchId.trim().length > 0
+    ? raw.batchId.trim()
+    : undefined;
+  const batchIndex = Number.isInteger(raw?.batchIndex) && Number(raw?.batchIndex) >= 0
+    ? Number(raw?.batchIndex)
+    : undefined;
+  const batchSize = Number.isInteger(raw?.batchSize) && Number(raw?.batchSize) > 0
+    ? Number(raw?.batchSize)
+    : undefined;
+  const batchLabel = typeof raw?.batchLabel === "string" && raw.batchLabel.trim().length > 0
+    ? raw.batchLabel.trim()
+    : undefined;
+  return { operationId, baseVersion, lamportTime, clientId, batchId, batchIndex, batchSize, batchLabel };
 };
 
 const assertSessionAccess = async (sessionId: number, userId: number): Promise<number> => {
@@ -370,6 +397,10 @@ const toSessionOperationItemVO = (row: OperationRow): SessionOperationItemVO => 
     serverVersion: toNumber(row.server_version, toNumber(row.version)),
     lamportTime: toNumber(row.lamport_time),
     ...(typeof row.client_id === "string" && row.client_id.length > 0 ? { clientId: row.client_id } : {}),
+    ...(typeof row.batch_id === "string" && row.batch_id.length > 0 ? { batchId: row.batch_id } : {}),
+    ...(typeof row.batch_index !== "undefined" && row.batch_index !== null ? { batchIndex: toNumber(row.batch_index) } : {}),
+    ...(typeof row.batch_size !== "undefined" && row.batch_size !== null ? { batchSize: toNumber(row.batch_size) } : {}),
+    ...(typeof row.batch_label === "string" && row.batch_label.length > 0 ? { batchLabel: row.batch_label } : {}),
     ...(isRecord(row.resolved_result) || typeof row.resolved_result === "string"
       ? { resolvedResult: toObject(row.resolved_result) }
       : {}),
@@ -444,6 +475,10 @@ const insertOperationAndHistory = async (
     serverVersion: number;
     lamportTime: number;
     clientId: string;
+    batchId?: string;
+    batchIndex?: number;
+    batchSize?: number;
+    batchLabel?: string;
     resolvedResult: Record<string, unknown>;
     conflictType: ConflictType;
   },
@@ -599,6 +634,10 @@ const createGraphic = async (
       serverVersion: nextVersion,
       lamportTime: normalizedMeta.lamportTime,
       clientId: normalizedMeta.clientId,
+      batchId: normalizedMeta.batchId,
+      batchIndex: normalizedMeta.batchIndex,
+      batchSize: normalizedMeta.batchSize,
+      batchLabel: normalizedMeta.batchLabel,
       resolvedResult,
       conflictType: "none"
     }, options);
@@ -727,6 +766,10 @@ const updateGraphic = async (
         serverVersion: nextVersion,
         lamportTime: normalizedMeta.lamportTime,
         clientId: normalizedMeta.clientId,
+        batchId: normalizedMeta.batchId,
+        batchIndex: normalizedMeta.batchIndex,
+        batchSize: normalizedMeta.batchSize,
+        batchLabel: normalizedMeta.batchLabel,
         resolvedResult,
         conflictType: "delete_wins"
       }, options);
@@ -855,6 +898,10 @@ const updateGraphic = async (
       serverVersion: nextVersion,
       lamportTime: normalizedMeta.lamportTime,
       clientId: normalizedMeta.clientId,
+      batchId: normalizedMeta.batchId,
+      batchIndex: normalizedMeta.batchIndex,
+      batchSize: normalizedMeta.batchSize,
+      batchLabel: normalizedMeta.batchLabel,
       resolvedResult,
       conflictType: mergeResult.conflictType
     }, options);
@@ -1014,6 +1061,10 @@ const deleteGraphic = async (
       serverVersion: nextVersion,
       lamportTime: normalizedMeta.lamportTime,
       clientId: normalizedMeta.clientId,
+      batchId: normalizedMeta.batchId,
+      batchIndex: normalizedMeta.batchIndex,
+      batchSize: normalizedMeta.batchSize,
+      batchLabel: normalizedMeta.batchLabel,
       resolvedResult,
       conflictType: "none"
     }, options);

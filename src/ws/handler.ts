@@ -390,7 +390,11 @@ const onCreateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
       operationId: payload.operationId,
       baseVersion: payload.baseVersion,
       lamportTime: payload.lamportTime,
-      clientId: payload.clientId
+      clientId: payload.clientId,
+      batchId: payload.batchId,
+      batchIndex: payload.batchIndex,
+      batchSize: payload.batchSize,
+      batchLabel: payload.batchLabel
     }
   );
 
@@ -449,7 +453,11 @@ const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
       operationId: payload.operationId,
       baseVersion: payload.baseVersion,
       lamportTime: payload.lamportTime,
-      clientId: payload.clientId
+      clientId: payload.clientId,
+      batchId: payload.batchId,
+      batchIndex: payload.batchIndex,
+      batchSize: payload.batchSize,
+      batchLabel: payload.batchLabel
     }
   );
 
@@ -489,7 +497,11 @@ const onDeleteGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
       operationId: payload.operationId,
       baseVersion: payload.baseVersion,
       lamportTime: payload.lamportTime,
-      clientId: payload.clientId
+      clientId: payload.clientId,
+      batchId: payload.batchId,
+      batchIndex: payload.batchIndex,
+      batchSize: payload.batchSize,
+      batchLabel: payload.batchLabel
     }
   );
 

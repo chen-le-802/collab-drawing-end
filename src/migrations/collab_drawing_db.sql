@@ -149,6 +149,10 @@ CREATE TABLE `operations`  (
   `server_version` bigint NULL DEFAULT NULL COMMENT '服务端确认后的全局版本',
   `lamport_time` bigint NOT NULL DEFAULT 0 COMMENT '客户端 Lamport 逻辑时钟',
   `client_id` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '客户端实例标识',
+  `batch_id` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '批量操作分组标识',
+  `batch_index` int NULL DEFAULT NULL COMMENT '批量内序号（从0开始）',
+  `batch_size` int NULL DEFAULT NULL COMMENT '批量总数',
+  `batch_label` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '批量操作标签',
   `operation_data` json NOT NULL COMMENT '操作内容',
   `resolved_result` json NULL COMMENT 'CRDT 合并后的服务端解决结果',
   `conflict_type` varchar(30) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL DEFAULT 'none' COMMENT '冲突类型：none/field_merge/field_conflict/delete_wins/duplicate_operation',
@@ -167,6 +171,8 @@ CREATE TABLE `operations`  (
   INDEX `idx_operations_timestamp`(`timestamp` ASC) USING BTREE,
   INDEX `idx_operations_session_server_version`(`session_id` ASC, `server_version` ASC) USING BTREE,
   INDEX `idx_operations_client_id`(`client_id` ASC) USING BTREE,
+  INDEX `idx_operations_batch_id`(`batch_id` ASC) USING BTREE,
+  INDEX `idx_operations_session_batch`(`session_id` ASC, `batch_id` ASC, `server_version` ASC) USING BTREE,
   INDEX `idx_operations_conflict_type`(`conflict_type` ASC) USING BTREE
 ) ENGINE = InnoDB AUTO_INCREMENT = 3075 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = '操作记录表' ROW_FORMAT = Dynamic;
 

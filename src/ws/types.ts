@@ -35,6 +35,10 @@ export interface CreateGraphicData {
   clientId?: string;
   baseVersion?: number;
   lamportTime?: number;
+  batchId?: string;
+  batchIndex?: number;
+  batchSize?: number;
+  batchLabel?: string;
   objectKey: string;
   objectType: "line" | "rect" | "circle" | "text" | "path" | "image";
   positionX: number;
@@ -59,6 +63,10 @@ export interface UpdateGraphicData {
   clientId?: string;
   baseVersion?: number;
   lamportTime?: number;
+  batchId?: string;
+  batchIndex?: number;
+  batchSize?: number;
+  batchLabel?: string;
   objectKey: string;
   patch?: {
     positionX?: number;
@@ -98,6 +106,10 @@ export interface DeleteGraphicData {
   clientId?: string;
   baseVersion?: number;
   lamportTime?: number;
+  batchId?: string;
+  batchIndex?: number;
+  batchSize?: number;
+  batchLabel?: string;
   objectKey: string;
 }
 
