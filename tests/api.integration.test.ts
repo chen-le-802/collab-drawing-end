@@ -396,6 +396,22 @@ suite("API integration", () => {
     expect(joinedKeysAfterLeave).not.toContain(sessionKey);
   });
 
+  it("forbids graphics access after member leaves session", async () => {
+    const owner = await registerAndLogin();
+    const joiner = await registerAndLogin();
+    const { sessionKey } = await createSessionAndJoinByInvite(owner, joiner);
+
+    const leaveRes = await request(app)
+      .post(`/api/v1/sessions/${sessionKey}/leave`)
+      .set(authHeader(joiner.token));
+    expect(leaveRes.body.code).toBe(0);
+
+    const graphicsRes = await request(app)
+      .get(`/api/v1/sessions/${sessionKey}/graphics`)
+      .set(authHeader(joiner.token));
+    expect(graphicsRes.body.code).toBe(2003);
+  });
+
   it("returns full/incremental graphics by sinceVersion", async () => {
     const owner = await registerAndLogin();
 
@@ -1361,6 +1377,63 @@ suite("API integration", () => {
     expect(graphicsRes.body.code).toBe(0);
     const keys = (graphicsRes.body.data.graphics as Array<{ objectKey: string }>).map((item) => item.objectKey);
     expect(keys).not.toContain(objectKey);
+
+    await clientA.close();
+    await clientB.close();
+  });
+
+  it("ws consistency: graphic_deleted payload includes sessionKey/userId/objectKey/currentVersion", async () => {
+    const owner = await registerAndLogin();
+    const joiner = await registerAndLogin();
+    const { sessionId, sessionKey } = await createSessionAndJoinByInvite(owner, joiner);
+    const objectKey = `obj_${randomText()}_deleted_payload`;
+
+    const created = await operationService.createGraphic(
+      sessionId,
+      owner.userId,
+      {
+        objectKey,
+        objectType: "rect",
+        positionX: 48,
+        positionY: 52,
+        width: 110,
+        height: 70,
+        strokeColor: "#111111",
+        fillColor: "#ffffff",
+        strokeWidth: 2,
+        zIndex: 1
+      },
+      {
+        operationId: `op_${randomText()}_deleted_payload_create`,
+        clientId: "it_ws_client",
+        baseVersion: 0,
+        lamportTime: Date.now()
+      }
+    );
+
+    const clientA = await connectWsClient(wsBaseUrl, owner.token, sessionKey);
+    const clientB = await connectWsClient(wsBaseUrl, joiner.token, sessionKey);
+    await clientA.waitFor((m) => m.type === "session_joined");
+    await clientB.waitFor((m) => m.type === "session_joined");
+
+    const deleteOpId = `op_${randomText()}_deleted_payload_delete`;
+    clientA.send("delete_graphic", {
+      sessionKey,
+      objectKey,
+      operationId: deleteOpId,
+      clientId: "it_ws_client",
+      baseVersion: created.resolved.serverVersion,
+      lamportTime: Date.now() + 1
+    });
+
+    await clientA.waitFor((m) => m.type === "operation_resolved" && m.data.operationId === deleteOpId);
+    const deleted = await clientB.waitFor((m) => m.type === "graphic_deleted" && m.data.objectKey === objectKey);
+
+    expect(deleted.data.sessionKey).toBe(sessionKey);
+    expect(deleted.data.userId).toBe(owner.userId);
+    expect(deleted.data.objectKey).toBe(objectKey);
+    expect(typeof deleted.data.currentVersion).toBe("number");
+    expect(Number(deleted.data.currentVersion)).toBeGreaterThan(created.resolved.serverVersion);
 
     await clientA.close();
     await clientB.close();

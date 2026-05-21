@@ -96,7 +96,7 @@ export interface UpdateGraphicDTO {
   height?: number;
   strokeColor?: string;
   lineStyle?: GraphicLineStyle;
-  fillColor?: string;
+  fillColor?: string | null;
   strokeWidth?: number;
   textContent?: string;
   fontSize?: number;

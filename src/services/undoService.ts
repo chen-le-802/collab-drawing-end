@@ -228,31 +228,6 @@ const findHistoryByKind = async (
   return rows[0] ?? null;
 };
 
-const getHistoryLocked = async (
-  userId: number,
-  sessionId: number,
-  kind: HistoryLookupKind
-): Promise<HistoryOperationRow> => {
-  const connection = await dbPool.getConnection();
-  try {
-    await connection.beginTransaction();
-    const history = await findHistoryByKind(connection, userId, sessionId, kind);
-    if (!history) {
-      throw new UndoServiceError(
-        kind === "undo" ? "NO_UNDOABLE_OPERATION" : "NO_REDOABLE_OPERATION",
-        kind === "undo" ? "无可撤销操作" : "无可重做操作"
-      );
-    }
-    await connection.commit();
-    return history;
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
-  }
-};
-
 const buildOperationVO = (
   operationRecordId: number,
   sessionId: number,
@@ -290,31 +265,6 @@ const toUpdatePatchFromGraphic = (graphic: GraphicVO): Record<string, unknown> =
   rotation: graphic.rotation,
   zIndex: graphic.zIndex
 });
-
-const markUndoHistoryDone = async (
-  userId: number,
-  sessionId: number,
-  historyId: number,
-  inverseOperationRecordId: number
-): Promise<void> => {
-  // undo 成功后把“可撤销”切到“可重做”，并记录本次逆向操作，形成闭环。
-  await dbPool.execute(
-    "UPDATE user_operation_history SET can_undo = 0, can_redo = 1, undo_operation_id = ? WHERE id = ? AND user_id = ? AND session_id = ?",
-    [inverseOperationRecordId, historyId, userId, sessionId]
-  );
-};
-
-const markRedoHistoryDone = async (
-  userId: number,
-  sessionId: number,
-  historyId: number
-): Promise<void> => {
-  // redo 成功后回到可撤销状态，和普通编辑后的历史状态保持一致。
-  await dbPool.execute(
-    "UPDATE user_operation_history SET can_undo = 1, can_redo = 0 WHERE id = ? AND user_id = ? AND session_id = ?",
-    [historyId, userId, sessionId]
-  );
-};
 
 const mapOperationServiceError = (error: OperationServiceError): UndoServiceError => {
   if (error.code === "SESSION_NOT_FOUND") {
@@ -569,36 +519,68 @@ const applyRedoByHistory = async (
 
 const undoImpl = async (sessionId: number, userId: number, meta?: UndoRedoMeta): Promise<UndoRedoResult> => {
   await ensureSessionAndMember(sessionId, userId);
-  const history = await getHistoryLocked(userId, sessionId, "undo");
-  const fallbackOperationId = history.operation_id ?? String(history.operation_record_id);
-  const normalizedMeta = normalizeUndoRedoMeta("undo", fallbackOperationId, toNumber(history.server_version), meta);
+  const connection = await dbPool.getConnection();
   try {
-    const result = await applyUndoByHistory(history, userId, normalizedMeta);
-    // 只在真正执行成功后切换历史状态，避免异常时丢失可恢复链路。
-    await markUndoHistoryDone(userId, sessionId, history.history_id, result.operation?.operationId ?? 0);
-    return result;
-  } catch (error) {
-    if (error instanceof OperationServiceError) {
-      throw mapOperationServiceError(error);
+    await connection.beginTransaction();
+    const history = await findHistoryByKind(connection, userId, sessionId, "undo");
+    if (!history) {
+      throw new UndoServiceError("NO_UNDOABLE_OPERATION", "无可撤销操作");
     }
+    const fallbackOperationId = history.operation_id ?? String(history.operation_record_id);
+    const normalizedMeta = normalizeUndoRedoMeta("undo", fallbackOperationId, toNumber(history.server_version), meta);
+    try {
+      const result = await applyUndoByHistory(history, userId, normalizedMeta);
+      // 只在真正执行成功后切换历史状态，避免异常时丢失可恢复链路。
+      await connection.execute(
+        "UPDATE user_operation_history SET can_undo = 0, can_redo = 1, undo_operation_id = ? WHERE id = ? AND user_id = ? AND session_id = ?",
+        [result.operation?.operationId ?? 0, history.history_id, userId, sessionId]
+      );
+      await connection.commit();
+      return result;
+    } catch (error) {
+      if (error instanceof OperationServiceError) {
+        throw mapOperationServiceError(error);
+      }
+      throw error;
+    }
+  } catch (error) {
+    await connection.rollback();
     throw error;
+  } finally {
+    connection.release();
   }
 };
 
 const redoImpl = async (sessionId: number, userId: number, meta?: UndoRedoMeta): Promise<UndoRedoResult> => {
   await ensureSessionAndMember(sessionId, userId);
-  const history = await getHistoryLocked(userId, sessionId, "redo");
-  const fallbackOperationId = history.operation_id ?? String(history.operation_record_id);
-  const normalizedMeta = normalizeUndoRedoMeta("redo", fallbackOperationId, toNumber(history.server_version), meta);
+  const connection = await dbPool.getConnection();
   try {
-    const result = await applyRedoByHistory(history, userId, normalizedMeta);
-    await markRedoHistoryDone(userId, sessionId, history.history_id);
-    return result;
-  } catch (error) {
-    if (error instanceof OperationServiceError) {
-      throw mapOperationServiceError(error);
+    await connection.beginTransaction();
+    const history = await findHistoryByKind(connection, userId, sessionId, "redo");
+    if (!history) {
+      throw new UndoServiceError("NO_REDOABLE_OPERATION", "无可重做操作");
     }
+    const fallbackOperationId = history.operation_id ?? String(history.operation_record_id);
+    const normalizedMeta = normalizeUndoRedoMeta("redo", fallbackOperationId, toNumber(history.server_version), meta);
+    try {
+      const result = await applyRedoByHistory(history, userId, normalizedMeta);
+      await connection.execute(
+        "UPDATE user_operation_history SET can_undo = 1, can_redo = 0 WHERE id = ? AND user_id = ? AND session_id = ?",
+        [history.history_id, userId, sessionId]
+      );
+      await connection.commit();
+      return result;
+    } catch (error) {
+      if (error instanceof OperationServiceError) {
+        throw mapOperationServiceError(error);
+      }
+      throw error;
+    }
+  } catch (error) {
+    await connection.rollback();
     throw error;
+  } finally {
+    connection.release();
   }
 };
 

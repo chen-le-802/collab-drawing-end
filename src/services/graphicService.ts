@@ -139,7 +139,7 @@ const assertSessionExists = async (sessionId: number): Promise<void> => {
 // 图形读写都要求会话成员权限。
 const assertSessionMember = async (sessionId: number, userId: number): Promise<void> => {
   const member = await findSessionMember(sessionId, userId);
-  if (!member) {
+  if (!member || member.membership_status !== "active") {
     throw new GraphicServiceError("SESSION_FORBIDDEN", "无会话访问权限");
   }
 };
@@ -235,7 +235,7 @@ const normalizeUpdateGraphicData = (data: UpdateGraphicDTO): UpdateGraphicDTO =>
   if (typeof data.lineStyle !== "undefined" && !LINE_STYLES.includes(data.lineStyle)) {
     throw new GraphicServiceError("INVALID_ARGUMENT", "lineStyle 参数错误");
   }
-  if (typeof data.fillColor !== "undefined") {
+  if (typeof data.fillColor !== "undefined" && data.fillColor !== null) {
     assertString(data.fillColor, "fillColor");
   }
   if (typeof data.strokeWidth !== "undefined") {

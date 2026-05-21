@@ -377,7 +377,7 @@ const onCreateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
       height: payload.height,
       strokeColor: payload.strokeColor,
       lineStyle: payload.lineStyle,
-      fillColor: payload.fillColor,
+      fillColor: typeof payload.fillColor === "string" ? payload.fillColor : undefined,
       strokeWidth: payload.strokeWidth,
       zIndex: payload.zIndex,
       textContent: payload.textContent,
@@ -440,7 +440,9 @@ const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
       lineStyle: patchPayload.lineStyle === "dashed" || patchPayload.lineStyle === "solid"
         ? patchPayload.lineStyle
         : payload.lineStyle,
-      fillColor: typeof patchPayload.fillColor === "string" ? patchPayload.fillColor : payload.fillColor,
+      fillColor: typeof patchPayload.fillColor === "string" || patchPayload.fillColor === null
+        ? patchPayload.fillColor
+        : (payload.fillColor === null ? null : payload.fillColor),
       strokeWidth: typeof patchPayload.strokeWidth === "number" ? patchPayload.strokeWidth : payload.strokeWidth,
       zIndex: typeof patchPayload.zIndex === "number" ? patchPayload.zIndex : payload.zIndex,
       textContent: typeof patchPayload.textContent === "string" ? patchPayload.textContent : payload.textContent,
@@ -518,7 +520,18 @@ const onDeleteGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
   safeSend(ws, "operation_resolved", resolvedPayload);
 
   if (result.deletedObjectKey) {
-    broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: result.deletedObjectKey }, ws);
+    broadcastRoom(
+      context,
+      sessionKey,
+      "graphic_deleted",
+      {
+        sessionKey,
+        userId: ws.clientData.userId,
+        objectKey: result.deletedObjectKey,
+        currentVersion: result.resolved.serverVersion
+      },
+      ws
+    );
   }
 };
 
@@ -621,7 +634,18 @@ const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     } else if (operationItem.operationType === "update_graphic") {
       broadcastRoom(context, sessionKey, "graphic_updated", operationItem.data, ws);
     } else {
-      broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: operationItem.objectKey }, ws);
+      broadcastRoom(
+        context,
+        sessionKey,
+        "graphic_deleted",
+        {
+          sessionKey,
+          userId: ws.clientData.userId,
+          objectKey: operationItem.objectKey,
+          currentVersion: operationItem.version
+        },
+        ws
+      );
     }
   });
 
@@ -721,7 +745,18 @@ const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
     } else if (operationItem.operationType === "update_graphic") {
       broadcastRoom(context, sessionKey, "graphic_updated", operationItem.data, ws);
     } else {
-      broadcastRoom(context, sessionKey, "graphic_deleted", { objectKey: operationItem.objectKey }, ws);
+      broadcastRoom(
+        context,
+        sessionKey,
+        "graphic_deleted",
+        {
+          sessionKey,
+          userId: ws.clientData.userId,
+          objectKey: operationItem.objectKey,
+          currentVersion: operationItem.version
+        },
+        ws
+      );
     }
   });
 
