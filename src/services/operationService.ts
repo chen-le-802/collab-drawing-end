@@ -384,6 +384,10 @@ const toUpdatePatch = (graphic: GraphicVO): UpdateGraphicDTO => ({
   zIndex: graphic.zIndex
 });
 
+const getGraphicFieldValue = (graphic: GraphicVO, fieldName: string): unknown => {
+  return (toUpdatePatch(graphic) as Record<string, unknown>)[fieldName];
+};
+
 const toSessionOperationItemVO = (row: OperationRow): SessionOperationItemVO => {
   return {
     id: row.id,
@@ -743,6 +747,7 @@ const updateGraphic = async (
     }
     if (target.is_deleted === 1) {
       // 对象已被并发删除时，按 tombstone 规则拒绝更新并记录冲突。
+      const beforeGraphic = crdtMergeService.toGraphicVO(target);
       const nextVersion = await incrementSessionVersion(sessionId, connection);
       if (nextVersion === null) {
         throw new OperationServiceError("SESSION_NOT_FOUND", "会话不存在");
@@ -750,7 +755,7 @@ const updateGraphic = async (
       const resolvedResult = {
         operationType: "update_graphic",
         objectKey,
-        beforeGraphic: crdtMergeService.toGraphicVO(target),
+        beforeGraphic,
         appliedFields: [],
         rejectedFields: patchKeys,
         resolveReason: "delete_tombstone_blocked_update"
@@ -782,7 +787,7 @@ const updateGraphic = async (
           objectKey,
           conflictType: "delete_wins" as const,
           fieldName,
-          currentValue: (target as unknown as Record<string, unknown>)[fieldName],
+          currentValue: getGraphicFieldValue(beforeGraphic, fieldName),
           incomingValue: (patch as Record<string, unknown>)[fieldName],
           resolvedValue: null,
           resolveStrategy: "delete_wins_tombstone"
@@ -916,9 +921,9 @@ const updateGraphic = async (
           objectKey,
           conflictType: mergeResult.conflictType,
           fieldName,
-          currentValue: (mergeResult.targetGraphic as unknown as Record<string, unknown>)[fieldName],
+          currentValue: getGraphicFieldValue(beforeGraphic, fieldName),
           incomingValue: (patch as Record<string, unknown>)[fieldName],
-          resolvedValue: (toUpdatePatch(updatedGraphic) as Record<string, unknown>)[fieldName],
+          resolvedValue: getGraphicFieldValue(updatedGraphic, fieldName),
           resolveStrategy: "lamport_then_client_id"
         })),
         connection
