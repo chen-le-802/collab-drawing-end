@@ -37,16 +37,28 @@ import {
   UpdateGraphicData
 } from "./types";
 
+// WebSocket 业务错误码分层：
+// 1001 参数/协议错误
+// 2001 权限错误
+// 2002 业务状态不允许（如无可撤销项）
+// 3001 资源不存在
+// 3002 资源冲突（已存在）
+// 4001 服务端内部处理错误
 type WsErrorCode = 1001 | 2001 | 2002 | 3001 | 3002 | 4001;
 
+// WS 运行时上下文：
+// - rooms: 会话房间索引（sessionKey -> sockets）
+// - userConnections: 用户连接索引（userId -> sockets）
 type WsContext = {
   rooms: Map<string, Set<AuthedWebSocket>>;
   userConnections: Map<number, Set<AuthedWebSocket>>;
 };
 
+// 会话 key 格式约束与单消息大小上限。
 const SESSION_KEY_REG = /^[a-f0-9]{64}$/i;
 const MAX_PAYLOAD_SIZE = 1024 * 1024;
 
+// DB 记录 -> 前端成员 VO。
 const toMemberVO = (row: SessionMemberRow): MemberVO => {
   return {
     userId: row.user_id,
@@ -60,12 +72,14 @@ const toMemberVO = (row: SessionMemberRow): MemberVO => {
 
 const now = (): number => Date.now();
 
+// 统一封装服务端下发消息结构。
 const createServerMessage = <T>(type: ServerMessageType, data: T): ServerMessage<T> => ({
   type,
   data,
   timestamp: now()
 });
 
+// 安全发送：仅在连接仍处于 OPEN 时发送。
 const safeSend = <T>(ws: AuthedWebSocket, type: ServerMessageType, data: T): void => {
   if (ws.readyState !== WebSocket.OPEN) {
     return;
@@ -73,6 +87,7 @@ const safeSend = <T>(ws: AuthedWebSocket, type: ServerMessageType, data: T): voi
   ws.send(JSON.stringify(createServerMessage(type, data)));
 };
 
+// 统一错误下发入口，并对 4001 级错误触发告警。
 const sendError = (ws: AuthedWebSocket, originalType: string, code: WsErrorCode, message: string): void => {
   const payload: ErrorPayload = { code, message, originalType };
   safeSend(ws, "error", payload);
@@ -89,6 +104,10 @@ const sendError = (ws: AuthedWebSocket, originalType: string, code: WsErrorCode,
   }
 };
 
+// 解析并校验客户端消息：
+// 1) 兼容 Buffer/ArrayBuffer/Buffer[] 三种 RawData 形态
+// 2) 做 payload 大小限制
+// 3) 校验最小协议结构（type/timestamp）
 const parseMessage = (raw: WebSocket.RawData): BaseClientMessage | null => {
   let normalized = "";
   if (Buffer.isBuffer(raw)) {
@@ -121,6 +140,10 @@ const parseMessage = (raw: WebSocket.RawData): BaseClientMessage | null => {
   }
 };
 
+// 房间广播：
+// - 支持排除发送者（exclude）
+// - 默认本地广播后再发 Redis（多实例同步）
+// - fromRedis=true 时避免二次回推形成环路
 const broadcastRoom = <T>(
   context: WsContext,
   sessionKey: string,
@@ -149,6 +172,7 @@ const broadcastRoom = <T>(
   }
 };
 
+// 原始消息类型标准化（用于错误回包 originalType）。
 const normalizeOriginalType = (value: unknown): string => {
   if (typeof value !== "string" || value.trim().length === 0) {
     return "unknown";
@@ -156,6 +180,7 @@ const normalizeOriginalType = (value: unknown): string => {
   return value;
 };
 
+// 会话 key 参数校验。
 const requireSessionKey = (sessionKey: unknown): string | null => {
   if (typeof sessionKey !== "string" || !SESSION_KEY_REG.test(sessionKey)) {
     return null;
@@ -163,6 +188,7 @@ const requireSessionKey = (sessionKey: unknown): string | null => {
   return sessionKey;
 };
 
+// 加入房间：更新 rooms 与当前连接的 joinedSessionKeys。
 const joinRoom = (context: WsContext, sessionKey: string, ws: AuthedWebSocket): void => {
   const room = context.rooms.get(sessionKey) ?? new Set<AuthedWebSocket>();
   room.add(ws);
@@ -170,6 +196,7 @@ const joinRoom = (context: WsContext, sessionKey: string, ws: AuthedWebSocket): 
   ws.clientData.joinedSessionKeys.add(sessionKey);
 };
 
+// 离开房间：若房间为空则回收房间索引。
 const leaveRoom = (context: WsContext, sessionKey: string, ws: AuthedWebSocket): void => {
   const room = context.rooms.get(sessionKey);
   if (room) {
@@ -181,12 +208,14 @@ const leaveRoom = (context: WsContext, sessionKey: string, ws: AuthedWebSocket):
   ws.clientData.joinedSessionKeys.delete(sessionKey);
 };
 
+// 记录用户连接索引。
 const recordConnection = (context: WsContext, ws: AuthedWebSocket): void => {
   const group = context.userConnections.get(ws.clientData.userId) ?? new Set<AuthedWebSocket>();
   group.add(ws);
   context.userConnections.set(ws.clientData.userId, group);
 };
 
+// 清理用户连接索引。
 const clearConnection = (context: WsContext, ws: AuthedWebSocket): void => {
   const group = context.userConnections.get(ws.clientData.userId);
   if (group) {
@@ -197,6 +226,7 @@ const clearConnection = (context: WsContext, ws: AuthedWebSocket): void => {
   }
 };
 
+// 校验“用户是否是该会话 active 成员”，并返回 sessionId。
 const assertSessionMemberAccess = async (sessionKey: string, userId: number): Promise<{ sessionId: number }> => {
   const session = await findSessionBySessionKey(sessionKey);
   if (!session) {
@@ -214,6 +244,8 @@ const assertSessionMemberAccess = async (sessionKey: string, userId: number): Pr
   return { sessionId: session.id };
 };
 
+// 会话访问校验（带连接内缓存）：
+// 优先使用 sessionIdCache，未命中再查库并回填。
 const resolveSessionAccess = async (ws: AuthedWebSocket, sessionKey: string): Promise<{ sessionId: number }> => {
   const cachedSessionId = ws.clientData.sessionIdCache.get(sessionKey);
   if (typeof cachedSessionId === "number" && cachedSessionId > 0) {
@@ -225,6 +257,7 @@ const resolveSessionAccess = async (ws: AuthedWebSocket, sessionKey: string): Pr
 };
 
 
+// 将 service 层异常映射为统一 WS 错误码和用户可读文案。
 const mapBusinessError = (error: unknown): { code: WsErrorCode; message: string } => {
   if (error instanceof SessionServiceError) {
     if (error.code === "SESSION_NOT_FOUND") {
@@ -280,6 +313,11 @@ const mapBusinessError = (error: unknown): { code: WsErrorCode; message: string 
   return { code: 4001, message: "服务器错误" };
 };
 
+// join_session：
+// - 校验成员身份
+// - 标记在线并刷新心跳
+// - 回给当前连接 session_joined（成员+图元快照）
+// - 向房间其他成员广播 member_joined
 const onJoinSession = async (context: WsContext, ws: AuthedWebSocket, payload: JoinSessionData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
   if (!sessionKey) {
@@ -320,6 +358,11 @@ const onJoinSession = async (context: WsContext, ws: AuthedWebSocket, payload: J
   );
 };
 
+// leave_session：
+// - 标记成员 left 与离线
+// - 连接离开房间
+// - 回给自己 session_left
+// - 房间广播 member_left
 const onLeaveSession = async (context: WsContext, ws: AuthedWebSocket, payload: LeaveSessionData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
   if (!sessionKey) {
@@ -354,6 +397,8 @@ const onLeaveSession = async (context: WsContext, ws: AuthedWebSocket, payload: 
   });
 };
 
+// create_graphic：
+// 调用 operationService 创建图元，先回发 operation_resolved，再广播 graphic_created。
 const onCreateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload: CreateGraphicData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
   if (!sessionKey || typeof payload.objectKey !== "string") {
@@ -415,6 +460,8 @@ const onCreateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
   }
 };
 
+// update_graphic：
+// 兼容 patch 形态与扁平字段形态，统一交给 operationService.updateGraphic。
 const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload: UpdateGraphicData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
   if (!sessionKey || typeof payload.objectKey !== "string") {
@@ -480,6 +527,8 @@ const onUpdateGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
   }
 };
 
+// delete_graphic：
+// 调用 operationService 删除图元，按结果广播 graphic_deleted。
 const onDeleteGraphic = async (context: WsContext, ws: AuthedWebSocket, payload: DeleteGraphicData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
   if (!sessionKey || typeof payload.objectKey !== "string") {
@@ -535,6 +584,7 @@ const onDeleteGraphic = async (context: WsContext, ws: AuthedWebSocket, payload:
   }
 };
 
+// 查询当前用户在该会话内是否还能 undo/redo。
 const resolveUndoRedoState = async (
   connection: PoolConnection,
   userId: number,
@@ -555,6 +605,7 @@ const resolveUndoRedoState = async (
   };
 };
 
+// 批量撤销/重做的次数限制（1~50）。
 const resolveBatchTimes = (value: unknown): number => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
@@ -571,6 +622,10 @@ const resolveBatchTimes = (value: unknown): number => {
 };
 
 
+// undo：
+// - 支持 times 批量撤销
+// - 中途遇到“无可撤销项”时保留已成功部分
+// - 广播图元变化并回 undo_result
 const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedoData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
   if (!sessionKey) {
@@ -683,6 +738,10 @@ const onUndo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
   });
 };
 
+// redo：
+// - 支持 times 批量重做
+// - 中途遇到“无可重做项”时保留已成功部分
+// - 广播图元变化并回 redo_result
 const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedoData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
   if (!sessionKey) {
@@ -793,10 +852,12 @@ const onRedo = async (context: WsContext, ws: AuthedWebSocket, payload: UndoRedo
   });
 };
 
+// ping -> pong 心跳响应。
 const onPing = (ws: AuthedWebSocket): void => {
   safeSend(ws, "pong", {});
 };
 
+// 协作光标广播：只广播给同房间其他成员。
 const onCursorMove = async (context: WsContext, ws: AuthedWebSocket, payload: CursorMoveData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
   if (!sessionKey || typeof payload.x !== "number" || typeof payload.y !== "number") {
@@ -823,6 +884,8 @@ const onCursorMove = async (context: WsContext, ws: AuthedWebSocket, payload: Cu
   );
 };
 
+// 协作选中广播：
+// 标准化 objectKey/objectKeys 后广播给同房间其他成员。
 const onSelectionChange = async (context: WsContext, ws: AuthedWebSocket, payload: SelectionChangeData): Promise<void> => {
   const sessionKey = requireSessionKey(payload?.sessionKey);
   if (!sessionKey) {
@@ -866,6 +929,7 @@ const onSelectionChange = async (context: WsContext, ws: AuthedWebSocket, payloa
   );
 };
 
+// 广播会话暂停状态（含操作者信息）。
 const broadcastSessionPaused = async (context: WsContext, sessionKey: string, userId: number): Promise<void> => {
   const session = await findSessionBySessionKey(sessionKey);
   if (!session) {
@@ -881,6 +945,8 @@ const broadcastSessionPaused = async (context: WsContext, sessionKey: string, us
 };
 
 
+// WS handler 工厂：
+// 对外暴露连接记录、消息处理、断连清理、自动入房、心跳回收、跨节点广播处理等能力。
 export const createWsHandler = (context: WsContext) => {
   return {
     recordConnection: (ws: AuthedWebSocket): void => {
@@ -989,6 +1055,7 @@ export const createWsHandler = (context: WsContext) => {
       });
     },
 
+    // 连接建立后可根据 URL 上的 sessionKey 自动执行一次 join。
     autoJoinIfNeeded: async (ws: AuthedWebSocket, sessionKey?: string | null): Promise<void> => {
       const normalized = requireSessionKey(sessionKey);
       if (!normalized) {
@@ -1002,6 +1069,7 @@ export const createWsHandler = (context: WsContext) => {
       }
     },
 
+    // 心跳回收：超过阈值未活动的连接会被 terminate。
     cleanExpiredConnections: (): void => {
       const timeoutMs = 30 * 1000;
       const nowAt = now();
@@ -1018,6 +1086,7 @@ export const createWsHandler = (context: WsContext) => {
       });
     },
 
+    // 拉取在线成员快照（供外部场景调用）。
     getOnlineMembersSnapshot: async (sessionKey: string): Promise<MemberVO[]> => {
       const session = await findSessionBySessionKey(sessionKey);
       if (!session) {
@@ -1039,10 +1108,12 @@ export const createWsHandler = (context: WsContext) => {
       });
     },
 
+    // 对外暴露：广播会话暂停事件。
     broadcastSessionPaused: async (sessionKey: string, userId: number): Promise<void> => {
       await broadcastSessionPaused(context, sessionKey, userId);
     },
 
+    // 处理来自 Redis 的跨节点广播消息（仅本地转发，不再回推 Redis）。
     handleRedisBroadcast: (payload: { sessionKey: string; messageType: ServerMessageType; data: unknown }): void => {
       broadcastRoom(
         context,

@@ -1,4 +1,12 @@
 import { PoolConnection, RowDataPacket } from "mysql2/promise";
+import { createHash } from "crypto";
+
+// Operation Service（后端协作核心服务）：
+// - 接收并执行图元 create/update/delete
+// - 做权限校验、幂等去重、版本推进
+// - 记录操作审计与冲突日志
+// - 处理并发冲突（调用 CRDT）
+// - 提供操作时间线、快照、回放、恢复等查询能力
 
 import { env } from "../config/env";
 import { getRedisClient, isRedisReady } from "../config/redis";
@@ -111,9 +119,24 @@ export class OperationServiceError extends Error {
   }
 }
 
+const MAX_DB_ID_LENGTH = 64;
+
+// 安全数值转换工具，避免 NaN 污染业务链路。
 const toNumber = (value: unknown, fallback = 0): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const normalizeDbId = (raw: string, maxLength = MAX_DB_ID_LENGTH): string => {
+  const value = raw.trim();
+  if (value.length <= maxLength) {
+    return value;
+  }
+  // 超长 ID 截断时保持“确定性唯一”：
+  // 前缀 + "_" + 短哈希，兼顾可读性与冲突概率。
+  const hash = createHash("sha1").update(value).digest("hex").slice(0, 12);
+  const prefixLen = Math.max(1, maxLength - hash.length - 1);
+  return `${value.slice(0, prefixLen)}_${hash}`;
 };
 
 const sleep = async (ms: number): Promise<void> => {
@@ -141,6 +164,7 @@ const logPerfMetric = (name: string, payload: PerfMetricPayload): void => {
 // Redis 幂等键：同一个 operationId 在 TTL 窗口内只应被执行一次。
 const buildOpDedupeKey = (operationId: string): string => `op:dedupe:${operationId}`;
 
+//先尝试 Redis SET NX EX 上锁（同 operationId 只允许一个执行）
 const tryAcquireOpDedupe = async (operationId: string): Promise<"acquired" | "exists" | "disabled"> => {
   // Redis 不可用时降级到数据库唯一键去重，避免功能不可用。
   if (!env.redisEnabled || !isRedisReady()) {
@@ -209,7 +233,7 @@ const buildDuplicateApplyResult = (
     }
   };
 };
-
+//如果 Redis 告诉“已经有人在执行”，就短暂等待并查 DB 已落库结果。
 const waitDuplicatedOperation = async (sessionId: number, operationId: string): Promise<OperationRow | null> => {
   // 首次请求可能仍在事务中，短轮询等待它提交后再返回幂等结果。
   for (let i = 0; i < 5; i += 1) {
@@ -259,6 +283,7 @@ const toObjectArray = (value: unknown): Record<string, unknown>[] => {
 
 const randomOpId = (): string => `op_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
+//meta 归一化
 const normalizeMeta = (
   sessionCurrentVersion: number,
   operationType: "create_graphic" | "update_graphic" | "delete_graphic",
@@ -266,21 +291,24 @@ const normalizeMeta = (
   raw?: OperationMeta
 ): NormalizedOperationMeta => {
   // 统一补齐协同元信息，兼容旧客户端缺字段的情况。
-  const operationId = typeof raw?.operationId === "string" && raw.operationId.trim().length > 0
+  const operationIdRaw = typeof raw?.operationId === "string" && raw.operationId.trim().length > 0
     ? raw.operationId.trim()
     : `${operationType}_${objectKey}_${randomOpId()}`;
+  const operationId = normalizeDbId(operationIdRaw);
   const baseVersion = Number.isInteger(raw?.baseVersion) && (raw?.baseVersion ?? -1) >= 0
     ? Number(raw?.baseVersion)
     : sessionCurrentVersion;
   const lamportTime = Number.isInteger(raw?.lamportTime) && (raw?.lamportTime ?? -1) >= 0
     ? Number(raw?.lamportTime)
     : Date.now();
-  const clientId = typeof raw?.clientId === "string" && raw.clientId.trim().length > 0
+  const clientIdRaw = typeof raw?.clientId === "string" && raw.clientId.trim().length > 0
     ? raw.clientId.trim()
     : "legacy_client";
-  const batchId = typeof raw?.batchId === "string" && raw.batchId.trim().length > 0
+  const clientId = normalizeDbId(clientIdRaw);
+  const batchIdRaw = typeof raw?.batchId === "string" && raw.batchId.trim().length > 0
     ? raw.batchId.trim()
     : undefined;
+  const batchId = batchIdRaw ? normalizeDbId(batchIdRaw) : undefined;
   const batchIndex = Number.isInteger(raw?.batchIndex) && Number(raw?.batchIndex) >= 0
     ? Number(raw?.batchIndex)
     : undefined;
@@ -293,6 +321,12 @@ const normalizeMeta = (
   return { operationId, baseVersion, lamportTime, clientId, batchId, batchIndex, batchSize, batchLabel };
 };
 
+// 写权限校验入口（所有写操作共用）：
+// 1) 会话存在
+// 2) 用户是 active 成员
+// 3) 会话未结束，画布未暂停
+// 4) 角色不是 viewer（role=0）
+// 返回当前会话版本，供 baseVersion 默认值与版本推进使用。
 const assertSessionAccess = async (sessionId: number, userId: number): Promise<number> => {
   const sessionVersion = await findSessionCurrentVersion(sessionId);
   if (sessionVersion === null) {
@@ -498,6 +532,15 @@ const insertOperationAndHistory = async (
   return operationRecordId;
 };
 
+// 创建图元主流程：
+// 1) 权限校验 + operationId 幂等去重（Redis + DB）
+// 开事务
+// incrementSessionVersion 拿新版本
+// 2) 写 graphic_objects（含“软删对象复活”分支）
+// 3) 写 operations + user_operation_history
+// 4) 写字段版本
+//提交事务
+// 返回 OperationApplyResult（给 WS handler 广播）
 const createGraphic = async (
   sessionId: number,
   userId: number,
@@ -699,6 +742,17 @@ const createGraphic = async (
   }
 };
 
+// 更新图元主流程：
+// 权限 + 幂等
+// 校验 patch 不为空
+// 查目标图元
+// 如果图元已删除：走 tombstone 逻辑（delete_wins）
+// 否则调用 crdtMergeService.mergeUpdatePatch(...) 做字段级裁决
+// 用合并后的 mergedPatch 更新 graphic_objects
+// 写 operations
+// 若有冲突，写 conflict_logs
+// 写字段版本
+// commit
 const updateGraphic = async (
   sessionId: number,
   userId: number,
@@ -995,6 +1049,14 @@ const updateGraphic = async (
   }
 };
 
+// 删除图元主流程（软删除）：
+// 通过 deleted_version 墓碑语义保证 delete-wins。
+// 权限 + 幂等
+// 查图元存在且未删
+// 版本推进
+// softDeleteGraphicById 软删除 + 记录 deleted_version/deleted_by/deleted_at
+// 写 operations 与用户历史
+// commit
 const deleteGraphic = async (
   sessionId: number,
   userId: number,
@@ -1127,6 +1189,7 @@ const deleteGraphic = async (
   }
 };
 
+// 增量操作同步：按 sinceVersion 返回后续操作，供前端断线追平。
 const getSessionOperationsBySessionKey = async (
   sessionKey: string,
   userId: number,
@@ -1152,6 +1215,8 @@ const getSessionOperationsBySessionKey = async (
   };
 };
 
+// 操作时间线：支持分页、版本区间、用户/类型/冲突类型筛选。
+//另外还会做“恢复操作聚合”处理（aggregateRestoreRows）
 const getSessionOperationTimelineBySessionKey = async (
   sessionKey: string,
   userId: number,
@@ -1381,6 +1446,7 @@ const getSessionOperationTimelineBySessionKey = async (
   };
 };
 
+// 冲突日志查询：供前端冲突面板展示与技术审计。
 const getSessionConflictLogsBySessionKey = async (
   sessionKey: string,
   userId: number,
@@ -1409,6 +1475,7 @@ const getSessionConflictLogsBySessionKey = async (
   };
 };
 
+// 创建快照：把当前会话的图元状态打包写到 canvas_snapshots。
 const createSessionSnapshotBySessionKey = async (
   sessionKey: string,
   userId: number,
@@ -1457,6 +1524,7 @@ const createSessionSnapshotBySessionKey = async (
   };
 };
 
+// 获取快照列表：按会话返回最近 N 条快照。
 const getSessionSnapshotsBySessionKey = async (
   sessionKey: string,
   userId: number,
@@ -1481,6 +1549,10 @@ const getSessionSnapshotsBySessionKey = async (
   };
 };
 
+// 历史回放：
+// 找 <= 目标版本的最近快照作为基线
+// 拉基线之后到目标版本的操作
+// 前端按这两块重建画布
 const getSessionReplayByVersion = async (
   sessionKey: string,
   userId: number,
@@ -1677,6 +1749,12 @@ const buildGraphicsMapByObjectKey = (graphics: Record<string, unknown>[]): Map<s
   return map;
 };
 
+// 恢复版本：把当前会话恢复到目标版本状态，并生成一批系统恢复操作。
+// 只有 manager/owner 可恢复
+// 先构建目标版本画布状态
+// 对比当前状态和目标状态
+// 差异转成一批 create/update/delete 操作执行
+// 形成新版本链（不是时间回退，是“前进式恢复”）
 const restoreSessionByVersion = async (
   sessionKey: string,
   userId: number,

@@ -4,25 +4,31 @@ import { findGraphicByObjectKey, GraphicRow } from "../models/graphicModel";
 import { FieldVersionRow, findGraphicFieldVersions } from "../models/operationModel";
 import { GraphicObjectType, GraphicVO, PathPoint, UpdateGraphicDTO } from "../types";
 
+// CRDT Merge Service（字段级并发合并器）：
+// 只解决一个问题：多人并发 update 同一图元时，某个字段到底采用谁的值。
+// 它不负责完整业务流程（权限、事务、落库审计），这些由 operationService 负责。
+
 export type ConflictType = "none" | "field_merge" | "field_conflict" | "delete_wins" | "duplicate_operation";
 
+// 合并上下文：由 operationService 在进入 merge 前组装。
 export type CrdtContext = {
-  sessionId: number;
-  objectKey: string;
+  sessionId: number; //会话id
+  objectKey: string;//图元id
   userId: number;
   operationId: string;
-  baseVersion: number;
-  lamportTime: number;
-  clientId: string;
-  nextVersion: number;
+  baseVersion: number;//客户端请求时看到的版本
+  lamportTime: number;//并发裁决关键
+  clientId: string;//并发裁决关键
+  nextVersion: number;//这次操作服务端准备写入的版本
 };
 
+// 合并结果：给 operationService 用于后续写库和日志记录。
 export type CrdtMergeResult = {
-  mergedPatch: UpdateGraphicDTO;
-  appliedFields: string[];
-  rejectedFields: string[];
-  conflictType: ConflictType;
-  resolveReason: string;
+  mergedPatch: UpdateGraphicDTO; //最终可落库patch
+  appliedFields: string[]; //本次采用了哪些字段
+  rejectedFields: string[];  //拒绝了哪些字段
+  conflictType: ConflictType;  //冲突原因
+  resolveReason: string;  //冲突原因说明
   targetGraphic: GraphicRow;
 };
 
@@ -49,6 +55,7 @@ const FIELD_MAP: Record<string, keyof UpdateGraphicDTO> = {
   zIndex: "zIndex"
 };
 
+// pathPoints 兼容解析：把 path 点兼容成统一数组（支持数组和 JSON 字符串两种形态）
 const parsePathPoints = (value: unknown): PathPoint[] | null => {
   if (!value) {
     return null;
@@ -99,10 +106,14 @@ const toGraphicVO = (row: GraphicRow): GraphicVO => {
   };
 };
 
+// 读取当前图元某字段值（冲突拒绝时会回填当前值）。
 const rowValueByField = (graphic: GraphicVO, fieldName: keyof UpdateGraphicDTO): unknown => {
   return graphic[fieldName];
 };
 
+// 单字段冲突裁决规则（核心）：
+// 1) 先比 lamport_time（大者胜）
+// 2) lamport 相同再比 clientId（稳定 tie-break，保证多端一致）
 const resolveFieldConflict = (
   incomingLamport: number,
   incomingClientId: string,
@@ -143,6 +154,10 @@ export type CrdtMergeService = {
   toGraphicVO(row: GraphicRow): GraphicVO;
 };
 
+// update patch 合并入口：
+// - 先校验目标图元存在且未删除
+// - 再逐字段执行冲突裁决
+// - 输出 mergedPatch/appliedFields/rejectedFields/conflictType
 const mergeUpdatePatch = async (
   context: CrdtContext,
   patch: UpdateGraphicDTO,
@@ -216,4 +231,5 @@ export const crdtMergeService: CrdtMergeService = {
 
 // 给 operationService 复用的字段列表，确保字段版本推进与 merge 判定一致。
 export const CRDT_FIELD_NAMES: Array<keyof UpdateGraphicDTO> = Object.keys(FIELD_MAP) as Array<keyof UpdateGraphicDTO>;
+// 当前受支持的图元类型（供外部逻辑统一约束）。
 export const CRDT_GRAPHIC_TYPES: GraphicObjectType[] = ["line", "rect", "circle", "text", "path", "image"];

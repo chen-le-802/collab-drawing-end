@@ -14,6 +14,7 @@ import { closeWsSubscriber, initWsSubscriber } from "./pubsub";
 import { createWsHandler } from "./handler";
 import { AuthedWebSocket } from "./types";
 
+// 握手鉴权结果结构：只有 ok=true 且 userId/username/token 完整时才允许升级 WS。
 type VerifyResult = {
   ok: boolean;
   userId?: number;
@@ -21,10 +22,13 @@ type VerifyResult = {
   token?: string;
 };
 
+// WebSocket 固定入口与连接存活检查间隔。
 const WS_PATH = "/ws";
 const HEARTBEAT_CHECK_INTERVAL_MS = 10_000;
+// 对外广播能力依赖的当前 handler 引用（用于 HTTP 侧触发 WS 广播）。
 let currentWsHandler: ReturnType<typeof createWsHandler> | null = null;
 
+// 解析升级请求 URL。解析失败时返回 null，后续走鉴权失败分支。
 const parseRequestUrl = (req: IncomingMessage): URL | null => {
   if (!req.url) {
     return null;
@@ -37,6 +41,13 @@ const parseRequestUrl = (req: IncomingMessage): URL | null => {
   }
 };
 
+// 从握手请求中执行 WS 鉴权：
+// 1) 校验路径必须是 /ws
+// 2) 提取 query token
+// 3) JWT 验签
+// 4) auth_tokens 表二次校验（支持服务端主动失效）
+// 5) 校验用户存在
+// 通过才允许升级连接。
 const verifyTokenFromRequest = async (req: IncomingMessage): Promise<VerifyResult> => {
   const parsedUrl = parseRequestUrl(req);
   if (!parsedUrl || parsedUrl.pathname !== WS_PATH) {
@@ -72,6 +83,8 @@ const verifyTokenFromRequest = async (req: IncomingMessage): Promise<VerifyResul
   }
 };
 
+// ws.verifyClient 回调包装：
+// 使用 WeakMap 暂存鉴权结果，待 connection 事件里初始化 clientData。
 const toVerifyClient = (
   authCache: WeakMap<IncomingMessage, { userId: number; username: string; token: string }>
 ): VerifyClientCallbackAsync => {
@@ -91,6 +104,12 @@ const toVerifyClient = (
   };
 };
 
+// 初始化 WebSocket 服务：
+// 创建 rooms（房间索引）
+// 创建 userConnections（用户连接索引）
+// 创建 handler = createWsHandler(...)
+// 如启用 Redis，订阅跨节点广播
+// 创建 WebSocketServer
 export const initWebSocketServer = (httpServer: HttpServer): WebSocketServer => {
   const authCache = new WeakMap<IncomingMessage, { userId: number; username: string; token: string }>();
   const rooms = new Map<string, Set<AuthedWebSocket>>();
@@ -119,7 +138,14 @@ export const initWebSocketServer = (httpServer: HttpServer): WebSocketServer => 
     verifyClient: toVerifyClient(authCache)
   });
 
+//   每次新连接：
+// 取鉴权缓存
+// 初始化 ws.clientData（userId、joinedSessionKeys、sessionIdCache、lastSeenAt）
+// handler.recordConnection(ws)
+// 如 URL 带 sessionKey -> autoJoinIfNeeded
+// 绑定 message/close/error 事件，分别交给 handler
   wsServer.on("connection", (socket: WebSocket, req: IncomingMessage) => {
+    // verifyClient 已通过，此处从缓存取鉴权结果并挂到 ws.clientData。
     const clientData = authCache.get(req);
     if (!clientData) {
       socket.close(1008, "Unauthorized");
@@ -131,8 +157,11 @@ export const initWebSocketServer = (httpServer: HttpServer): WebSocketServer => 
       userId: clientData.userId,
       username: clientData.username,
       token: clientData.token,
+      // 同一连接可能加入多个会话，记录其房间集合用于清理与广播过滤。
       joinedSessionKeys: new Set<string>(),
+      // sessionKey -> sessionId 缓存，减少重复数据库访问。
       sessionIdCache: new Map<string, number>(),
+      // 最近一次活动时间，用于心跳超时回收。
       lastSeenAt: Date.now()
     };
     handler.recordConnection(ws);
@@ -161,6 +190,7 @@ export const initWebSocketServer = (httpServer: HttpServer): WebSocketServer => 
   }, HEARTBEAT_CHECK_INTERVAL_MS);
 
   wsServer.on("close", () => {
+    // 服务关闭时，清理本地定时器与 Redis 相关资源。
     clearInterval(heartbeatTimer);
     void closeWsSubscriber();
     void closeRedis();
@@ -169,6 +199,7 @@ export const initWebSocketServer = (httpServer: HttpServer): WebSocketServer => 
   return wsServer;
 };
 
+// 供 HTTP 业务层调用：会话暂停状态变化时，主动触发 WS 广播。
 export const broadcastSessionPausedEvent = async (sessionKey: string, userId: number): Promise<void> => {
   if (!currentWsHandler) {
     return;
@@ -176,6 +207,7 @@ export const broadcastSessionPausedEvent = async (sessionKey: string, userId: nu
   await currentWsHandler.broadcastSessionPaused(sessionKey, userId);
 };
 
+// 供 HTTP 业务层调用：成员在线状态变化时，通过 handler 统一广播路径下发。
 export const broadcastSessionMemberStatusChangedEvent = (
   sessionKey: string,
   payload: { userId: number; username: string; onlineStatus: 0 | 1 }

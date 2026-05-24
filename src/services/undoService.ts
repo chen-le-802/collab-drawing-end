@@ -1,4 +1,5 @@
 import { PoolConnection, RowDataPacket } from "mysql2/promise";
+import { createHash } from "crypto";
 
 import { dbPool } from "../config/db";
 import { findSessionCurrentVersion } from "../models/graphicModel";
@@ -73,6 +74,18 @@ const toNumber = (value: unknown, fallback = 0): number => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const MAX_DB_ID_LENGTH = 64;
+
+const normalizeDbId = (raw: string, maxLength = MAX_DB_ID_LENGTH): string => {
+  const value = raw.trim();
+  if (value.length <= maxLength) {
+    return value;
+  }
+  const hash = createHash("sha1").update(value).digest("hex").slice(0, 12);
+  const prefixLen = Math.max(1, maxLength - hash.length - 1);
+  return `${value.slice(0, prefixLen)}_${hash}`;
+};
+
 // 用于生成兜底 operationId，避免 undo/redo 在缺少前端元信息时写库失败。
 const randomOpSuffix = (): string => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
@@ -84,12 +97,14 @@ const normalizeUndoRedoMeta = (
 ): NormalizedUndoRedoMeta => {
   // operationId/clientId/baseVersion/lamportTime 四元组统一在服务层补全，
   // 这样不管是 HTTP 还是 WS 入口都能复用同一套撤销重做逻辑。
-  const operationId = typeof raw?.operationId === "string" && raw.operationId.trim().length > 0
+  const operationIdRaw = typeof raw?.operationId === "string" && raw.operationId.trim().length > 0
     ? raw.operationId.trim()
     : `${kind}_${fallbackOperationId}_${randomOpSuffix()}`;
-  const clientId = typeof raw?.clientId === "string" && raw.clientId.trim().length > 0
+  const operationId = normalizeDbId(operationIdRaw);
+  const clientIdRaw = typeof raw?.clientId === "string" && raw.clientId.trim().length > 0
     ? raw.clientId.trim()
     : "undo_service";
+  const clientId = normalizeDbId(clientIdRaw);
   const baseVersion = Number.isInteger(raw?.baseVersion) && (raw?.baseVersion ?? -1) >= 0
     ? Number(raw?.baseVersion)
     : fallbackBaseVersion;
