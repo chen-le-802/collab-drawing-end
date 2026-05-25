@@ -30,6 +30,7 @@ import {
   JoinSessionPayload,
   LeaveSessionData,
   OperationResolvedPayload,
+  SessionRestoredPayload,
   SelectionChangeData,
   ServerMessage,
   ServerMessageType,
@@ -944,6 +945,15 @@ const broadcastSessionPaused = async (context: WsContext, sessionKey: string, us
   });
 };
 
+// 广播会话“恢复到某版本”事件，提示所有在线成员触发一次补偿同步。
+const broadcastSessionRestored = (
+  context: WsContext,
+  sessionKey: string,
+  payload: SessionRestoredPayload
+): void => {
+  broadcastRoom(context, sessionKey, "session_restored", payload);
+};
+
 
 // WS handler 工厂：
 // 对外暴露连接记录、消息处理、断连清理、自动入房、心跳回收、跨节点广播处理等能力。
@@ -1111,6 +1121,11 @@ export const createWsHandler = (context: WsContext) => {
     // 对外暴露：广播会话暂停事件。
     broadcastSessionPaused: async (sessionKey: string, userId: number): Promise<void> => {
       await broadcastSessionPaused(context, sessionKey, userId);
+    },
+
+    // 对外暴露：广播会话恢复事件（供 HTTP 恢复接口调用）。
+    broadcastSessionRestored: (sessionKey: string, payload: SessionRestoredPayload): void => {
+      broadcastSessionRestored(context, sessionKey, payload);
     },
 
     // 处理来自 Redis 的跨节点广播消息（仅本地转发，不再回推 Redis）。

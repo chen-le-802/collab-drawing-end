@@ -1,6 +1,10 @@
 import { Request, Response } from "express";
 import { findUserById } from "../models/userModel";
-import { broadcastSessionMemberStatusChangedEvent, broadcastSessionPausedEvent } from "../ws/server";
+import {
+  broadcastSessionMemberStatusChangedEvent,
+  broadcastSessionPausedEvent,
+  broadcastSessionRestoredEvent
+} from "../ws/server";
 
 import { ApiResponse } from "../types";
 import {
@@ -530,6 +534,16 @@ export const restoreSessionVersion = async (req: Request, res: Response): Promis
 
     // 恢复历史版本是“写操作”，由 service 内部继续做角色与会话状态校验。
     const result = await operationService.restoreSessionByVersion(sessionKey, userId, targetVersion);
+    const operator = await findUserById(userId);
+    broadcastSessionRestoredEvent(sessionKey, {
+      targetVersion,
+      restoredVersion: result.restoredVersion,
+      operatorUserId: userId,
+      operatorUsername: operator?.username ?? "",
+      createdCount: result.createdCount,
+      updatedCount: result.updatedCount,
+      deletedCount: result.deletedCount
+    });
     send(res, { code: 0, message: "恢复成功", data: result });
   } catch (error) {
     mapServiceError(res, error);

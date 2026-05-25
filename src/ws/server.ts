@@ -207,6 +207,28 @@ export const broadcastSessionPausedEvent = async (sessionKey: string, userId: nu
   await currentWsHandler.broadcastSessionPaused(sessionKey, userId);
 };
 
+// 供 HTTP 业务层调用：会话恢复成功后，通知在线成员进行画布补偿同步。
+export const broadcastSessionRestoredEvent = (
+  sessionKey: string,
+  payload: {
+    targetVersion: number;
+    restoredVersion: number;
+    operatorUserId: number;
+    operatorUsername: string;
+    createdCount: number;
+    updatedCount: number;
+    deletedCount: number;
+  }
+): void => {
+  if (!currentWsHandler) {
+    return;
+  }
+  currentWsHandler.broadcastSessionRestored(sessionKey, {
+    sessionKey,
+    ...payload
+  });
+};
+
 // 供 HTTP 业务层调用：成员在线状态变化时，通过 handler 统一广播路径下发。
 export const broadcastSessionMemberStatusChangedEvent = (
   sessionKey: string,

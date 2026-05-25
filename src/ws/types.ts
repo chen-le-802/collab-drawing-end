@@ -138,6 +138,7 @@ export interface SelectionChangeData {
 export type ServerMessageType =
   | "session_joined"
   | "session_left"
+  | "session_restored"
   | "session_paused"
   | "member_joined"
   | "member_left"
@@ -182,6 +183,17 @@ export type JoinSessionPayload = {
   currentVersion: number;
   members: MemberVO[];
   graphics: GraphicVO[];
+};
+
+export type SessionRestoredPayload = {
+  sessionKey: string;
+  targetVersion: number;
+  restoredVersion: number;
+  operatorUserId: number;
+  operatorUsername: string;
+  createdCount: number;
+  updatedCount: number;
+  deletedCount: number;
 };
 
 export type OperationResolvedPayload = {
