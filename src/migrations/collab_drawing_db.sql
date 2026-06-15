@@ -302,4 +302,92 @@ CREATE TABLE `users`  (
   UNIQUE INDEX `uk_users_username`(`username` ASC) USING BTREE
 ) ENGINE = InnoDB AUTO_INCREMENT = 256 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = '用户表' ROW_FORMAT = Dynamic;
 
+-- ----------------------------
+-- Foreign key constraints for database model diagrams
+-- ----------------------------
+ALTER TABLE `graphic_field_versions`
+  ADD INDEX `idx_graphic_field_versions_object_key`(`object_key` ASC) USING BTREE;
+
+ALTER TABLE `user_operation_history`
+  ADD INDEX `idx_user_op_history_session_id`(`session_id` ASC) USING BTREE;
+
+ALTER TABLE `auth_tokens`
+  ADD CONSTRAINT `fk_auth_tokens_user`
+    FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE;
+
+ALTER TABLE `sessions`
+  ADD CONSTRAINT `fk_sessions_creator`
+    FOREIGN KEY (`creator_id`) REFERENCES `users` (`id`)
+    ON DELETE RESTRICT ON UPDATE CASCADE;
+
+ALTER TABLE `session_members`
+  ADD CONSTRAINT `fk_session_members_session`
+    FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `fk_session_members_user`
+    FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE;
+
+ALTER TABLE `session_invites`
+  ADD CONSTRAINT `fk_session_invites_session`
+    FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE;
+
+ALTER TABLE `graphic_objects`
+  ADD CONSTRAINT `fk_graphic_objects_session`
+    FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `fk_graphic_objects_creator`
+    FOREIGN KEY (`creator_id`) REFERENCES `users` (`id`)
+    ON DELETE RESTRICT ON UPDATE CASCADE;
+
+ALTER TABLE `graphic_field_versions`
+  ADD CONSTRAINT `fk_graphic_field_versions_session`
+    FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `fk_graphic_field_versions_object`
+    FOREIGN KEY (`object_key`) REFERENCES `graphic_objects` (`object_key`)
+    ON DELETE CASCADE ON UPDATE CASCADE;
+
+ALTER TABLE `operations`
+  ADD CONSTRAINT `fk_operations_session`
+    FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `fk_operations_user`
+    FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+    ON DELETE RESTRICT ON UPDATE CASCADE,
+  ADD CONSTRAINT `fk_operations_object`
+    FOREIGN KEY (`object_key`) REFERENCES `graphic_objects` (`object_key`)
+    ON DELETE RESTRICT ON UPDATE CASCADE;
+
+ALTER TABLE `conflict_logs`
+  ADD CONSTRAINT `fk_conflict_logs_operation`
+    FOREIGN KEY (`operation_ref_id`) REFERENCES `operations` (`id`)
+    ON DELETE SET NULL ON UPDATE CASCADE;
+
+ALTER TABLE `canvas_snapshots`
+  ADD CONSTRAINT `fk_canvas_snapshots_session`
+    FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE;
+
+ALTER TABLE `user_operation_history`
+  ADD CONSTRAINT `fk_user_operation_history_user`
+    FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `fk_user_operation_history_session`
+    FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `fk_user_operation_history_operation`
+    FOREIGN KEY (`operation_id`) REFERENCES `operations` (`id`)
+    ON DELETE CASCADE ON UPDATE CASCADE;
+
+ALTER TABLE `system_logs`
+  ADD CONSTRAINT `fk_system_logs_user`
+    FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+    ON DELETE SET NULL ON UPDATE CASCADE,
+  ADD CONSTRAINT `fk_system_logs_session`
+    FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`)
+    ON DELETE SET NULL ON UPDATE CASCADE;
+
 SET FOREIGN_KEY_CHECKS = 1;

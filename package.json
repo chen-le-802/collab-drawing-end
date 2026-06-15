@@ -15,6 +15,7 @@
     "preflight:full": "ts-node src/scripts/preflight.ts full",
     "demo:conflict": "ts-node src/scripts/conflict-demo.ts",
     "demo:idempotency": "ts-node src/scripts/idempotency-demo.ts",
+    "demo:concurrency": "ts-node src/scripts/concurrency-smoke.ts",
     "backup:once": "ts-node src/scripts/backup.ts once",
     "backup:daemon": "ts-node src/scripts/backup.ts daemon",
     "test": "vitest run",
